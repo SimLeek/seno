@@ -87,6 +87,18 @@ class HeartbeatMessage:
     id: str
 
 
+@dataclass
+class StartupPingMessage:
+    type: str
+    id: str
+
+
+@dataclass
+class StartupPongMessage:
+    type: str
+    id: str
+
+
 # Load configuration
 with open("config.json", "r") as f:
     CONFIG = json.load(f)
@@ -243,6 +255,19 @@ def handle_message(message: Dict[str, Any]):
         schedule_hashes[message["sender"]] = message["hash"]
     elif msg_type == "heartbeat":
         heartbeats[message["id"]] = time.time()
+    elif msg_type == "startup_ping":
+        # Respond to startup ping with pong
+        pong_msg = StartupPongMessage(type="startup_pong", id=LOCAL_ID)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sender_ip = next(m.ip for m in MACHINES.values() if m.id == message["id"])
+            sock.sendto(json.dumps(asdict(pong_msg)).encode(), (sender_ip, 5000))
+            sock.close()
+        except Exception as e:
+            logger.error(f"Failed to send pong to {message['id']}: {e}")
+    elif msg_type == "startup_pong":
+        # Record that this machine is online
+        startup_responses[message["id"]] = time.time()
 
 
 def run_program(program_path: str) -> subprocess.Popen:
@@ -264,28 +289,78 @@ def stop_program(proc: subprocess.Popen):
             proc.kill()
 
 
+def wait_for_all_machines():
+    """Wait for all machines to be online before proceeding."""
+    global startup_responses, MACHINES
+    startup_responses = {}
+
+    logger.info("Waiting for all machines to come online...")
+    logger.info(f"Expected machines: {list(MACHINES.keys())}")
+
+    start_time = time.time()
+    timeout = 60  # 1 minute timeout
+
+    while time.time() - start_time < timeout:
+        # Send ping to all other machines
+        ping_msg = StartupPingMessage(type="startup_ping", id=LOCAL_ID)
+        broadcast(ping_msg)
+
+        # Check if all machines have responded
+        expected_machines = set(m.id for m in MACHINES.values() if m.id != LOCAL_ID)
+        responding_machines = set(startup_responses.keys())
+
+        if expected_machines.issubset(responding_machines):
+            logger.info("All machines are online! Proceeding with orchestration.")
+            return True
+
+        missing_machines = expected_machines - responding_machines
+        logger.info(f"Still waiting for machines: {list(missing_machines)}")
+
+        time.sleep(1)  # Wait 1 second before next ping
+
+    # Timeout reached
+    responding_machines = set(startup_responses.keys())
+    expected_machines = set(m.id for m in MACHINES.values() if m.id != LOCAL_ID)
+    missing_machines = expected_machines - responding_machines
+
+    if missing_machines:
+        logger.warning(f"Timeout reached. Missing machines: {list(missing_machines)}")
+        logger.warning("Proceeding with available machines only.")
+
+        # Update MACHINES to only include responding machines + local machine
+        global MACHINES
+        available_machine_ids = responding_machines | {LOCAL_ID}
+        MACHINES = {k: v for k, v in MACHINES.items() if k in available_machine_ids}
+        logger.info(f"Updated machine list: {list(MACHINES.keys())}")
+
+    return True
+
+
 # Global state
-resource_view = {m.id: m for m in MACHINES.values()}
+resource_view = {}
 schedule_hashes = {}
-heartbeats = {m.id: time.time() for m in MACHINES.values()}
+heartbeats = {}
 running_programs = {}
 current_schedule = None
+startup_responses = {}
+orchestration_started = False
 
 
 def resource_monitor():
     """Periodically share local resources."""
     while True:
-        resources = get_local_resources()
-        broadcast(ResourceMessage(
-            type="resource",
-            id=resources.id,
-            cpu_cores=resources.cpu_cores,
-            ram_gb=resources.ram_gb,
-            vram_gb=resources.vram_gb,
-            gpus=[asdict(gpu) for gpu in resources.gpus],
-            devices=resources.devices,
-            network=asdict(resources.network)
-        ))
+        if orchestration_started:
+            resources = get_local_resources()
+            broadcast(ResourceMessage(
+                type="resource",
+                id=resources.id,
+                cpu_cores=resources.cpu_cores,
+                ram_gb=resources.ram_gb,
+                vram_gb=resources.vram_gb,
+                gpus=[asdict(gpu) for gpu in resources.gpus],
+                devices=resources.devices,
+                network=asdict(resources.network)
+            ))
         time.sleep(0.2)  # 5 per second
 
 
@@ -319,7 +394,7 @@ def program_manager():
     """Manage running programs, monitor crashes/exits."""
     global running_programs
     while True:
-        if current_schedule:
+        if orchestration_started and current_schedule:
             # Check for crashed or ended programs
             for prog_name, proc in list(running_programs.items()):
                 if proc and proc.poll() is not None:
@@ -347,7 +422,7 @@ def program_manager():
                             running_programs[prog_key] = proc
                             logger.info(f"Started program {prog_key}")
                 else:
-                    if current_schedule.get(prog.name) == LOCAL_ID and - prog.name not in running_programs:
+                    if current_schedule.get(prog.name) == LOCAL_ID and prog.name not in running_programs:
                         proc = run_program(prog.path)
                         if proc:
                             running_programs[prog.name] = proc
@@ -358,33 +433,52 @@ def program_manager():
 def heartbeat_sender():
     """Send rapid heartbeats."""
     while True:
-        broadcast(HeartbeatMessage(type="heartbeat", id=LOCAL_ID))
+        if orchestration_started:
+            broadcast(HeartbeatMessage(type="heartbeat", id=LOCAL_ID))
         time.sleep(0.2)  # 5 per second
 
 
 def heartbeat_monitor():
     """Monitor heartbeats and detect failures."""
     while True:
-        current_time = time.time()
-        for machine_id, last_beat in list(heartbeats.items()):
-            if current_time - last_beat > 0.6:  # 3 missed heartbeats (600ms)
-                logger.warning(f"Machine {machine_id} failed")
-                resource_view.pop(machine_id, None)
-                heartbeats.pop(machine_id, None)
-                global current_schedule
-                current_schedule = None
-                schedule_computer()  # Recompute schedule on failure
+        if orchestration_started:
+            current_time = time.time()
+            for machine_id, last_beat in list(heartbeats.items()):
+                if current_time - last_beat > 0.6:  # 3 missed heartbeats (600ms)
+                    logger.warning(f"Machine {machine_id} failed")
+                    resource_view.pop(machine_id, None)
+                    heartbeats.pop(machine_id, None)
+                    global current_schedule
+                    current_schedule = None
+                    schedule_computer()  # Recompute schedule on failure
         time.sleep(0.2)  # 5 checks per second
 
 
 def main():
     """Main function to start all threads."""
+    global orchestration_started, resource_view, heartbeats
+
+    # Start the message receiver first
+    threading.Thread(target=receive_messages, daemon=True).start()
+
+    # Wait for all machines to be online
+    wait_for_all_machines()
+
+    # Initialize global state with available machines
+    resource_view = {m.id: m for m in MACHINES.values()}
+    heartbeats = {m.id: time.time() for m in MACHINES.values()}
+
+    # Start all orchestration threads
     threading.Thread(target=resource_monitor, daemon=True).start()
     threading.Thread(target=program_manager, daemon=True).start()
     threading.Thread(target=heartbeat_sender, daemon=True).start()
     threading.Thread(target=heartbeat_monitor, daemon=True).start()
-    threading.Thread(target=receive_messages, daemon=True).start()
-    schedule_computer()  # Compute schedule once at startup
+
+    # Mark orchestration as started
+    orchestration_started = True
+
+    # Compute initial schedule
+    schedule_computer()
 
     # Keep main thread alive
     while True:
