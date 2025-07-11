@@ -1,0 +1,63 @@
+{
+    "machines": {
+        "node1": {
+            "id": "node1",
+            "ip": "192.168.1.101",
+            "cpu_cores": 8,
+            "cpu_ghz": 3.2,
+            "ram_gb": 16,
+            "vram_gb": 4,
+            "gpus": [{"cores": 2048, "ghz": 1.5, "has_cuda": true}],
+            "devices": ["camera", "lidar"],
+            "network": {
+                "max_input_bandwidth_bps": 1000000000,
+                "max_output_bandwidth_bps": 1000000000,
+                "average_latency_ms": 1
+            }
+        },
+        "node2": {
+            "id": "node2",
+            "ip": "192.168.1.102",
+            "cpu_cores": 4,
+            "cpu_ghz": 2.5,
+            "ram_gb": 8,
+            "devices": [],
+            "network": {
+                "max_input_bandwidth_bps": 1000000000,
+                "max_output_bandwidth_bps": 1000000000,
+                "average_latency_ms": 1
+            }
+        }
+    },
+    "programs": [
+        {
+            "name": "image_processor",
+            "required_devices": ["camera"],
+            "cpu_cores": 2,
+            "ram_gb": 4,
+            "network_bandwidth_bps": 0,
+            "priority": 100,
+            "path": "image_processor.py"
+        },
+        {
+            "name": "data_analyzer",
+            "required_devices": [],
+            "cpu_cores": 1,
+            "ram_gb": 2,
+            "network_bandwidth_bps": 0,
+            "priority": 50,
+            "path": "data_analyzer.py"
+        },
+        {
+            "name": "serializer_deserializer",
+            "required_devices": [],
+            "cpu_cores": 0.5,
+            "ram_gb": 1,
+            "network_bandwidth_bps": 100000000,
+            "priority": 100,
+            "path": "ser_deser.py",
+            "run_on_all_machines": true
+        }
+    ],
+    "local_id": "node1"
+}
