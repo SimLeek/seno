@@ -60,24 +60,212 @@ class NetworkSetup:
                 raise
             return e
 
-    def get_primary_interface(self):
-        """Get the primary connected ethernet interface"""
+    def get_ethernet_interface(self):
+        """Get the ethernet interface (connected or disconnected)"""
         try:
             result = self.run_command("nmcli device status")
             lines = result.stdout.strip().split('\n')[1:]  # Skip header
 
+            ethernet_interfaces = []
             for line in lines:
                 parts = line.split()
-                if len(parts) >= 3 and parts[2] == "connected" and parts[1] == "ethernet":
-                    self.primary_if = parts[0]
-                    print(f"[*] Primary interface: {self.primary_if}")
-                    return
+                if len(parts) >= 2 and parts[1] == "ethernet":
+                    ethernet_interfaces.append({
+                        'device': parts[0],
+                        'state': parts[2] if len(parts) > 2 else 'unknown',
+                        'connection': parts[3] if len(parts) > 3 else '--'
+                    })
 
-            print("[ERROR] No connected Ethernet interface found")
-            sys.exit(1)
+            if not ethernet_interfaces:
+                print("[ERROR] No ethernet interface found")
+                sys.exit(1)
+
+            # Print available interfaces
+            print("\nAvailable ethernet interfaces:")
+            for i, iface in enumerate(ethernet_interfaces):
+                print(f"  {i + 1}. {iface['device']} - {iface['state']} ({iface['connection']})")
+
+            if len(ethernet_interfaces) == 1:
+                self.primary_if = ethernet_interfaces[0]['device']
+                print(f"[*] Using ethernet interface: {self.primary_if}")
+            else:
+                while True:
+                    try:
+                        choice = input(f"\nSelect interface (1-{len(ethernet_interfaces)}): ").strip()
+                        idx = int(choice) - 1
+                        if 0 <= idx < len(ethernet_interfaces):
+                            self.primary_if = ethernet_interfaces[idx]['device']
+                            print(f"[*] Selected interface: {self.primary_if}")
+                            break
+                        else:
+                            print("Invalid choice. Please try again.")
+                    except ValueError:
+                        print("Please enter a number.")
+
         except Exception as e:
-            print(f"[ERROR] Failed to get primary interface: {e}")
+            print(f"[ERROR] Failed to get ethernet interface: {e}")
             sys.exit(1)
+
+    def cleanup_existing_connections(self):
+        """Clean up any existing connections on the ethernet interface"""
+        try:
+            # Get all connections for this interface
+            result = self.run_command(f"nmcli connection show")
+            connections_to_remove = []
+
+            for line in result.stdout.strip().split('\n')[1:]:  # Skip header
+                parts = line.split()
+                if len(parts) >= 4 and parts[-1] == self.primary_if:
+                    conn_name = ' '.join(parts[:-3])  # Connection name might have spaces
+                    connections_to_remove.append(conn_name)
+
+            # Remove old connections
+            for conn_name in connections_to_remove:
+                try:
+                    print(f"[*] Removing existing connection: {conn_name}")
+                    self.run_command(f"sudo nmcli connection delete '{conn_name}'")
+                except subprocess.CalledProcessError:
+                    pass  # Connection might not exist
+
+        except Exception as e:
+            print(f"[WARNING] Failed to cleanup existing connections: {e}")
+
+    def detect_network_type(self):
+        """Detect if we're in a LAN environment or direct connection"""
+        print("\n[*] Detecting network environment...")
+
+        # First try to see if there's an existing DHCP server
+        print("[*] Checking for existing DHCP server...")
+
+        # Create a temporary connection to test DHCP
+        temp_conn_name = f"temp-dhcp-test-{random.randint(1000, 9999)}"
+        try:
+            self.run_command(f"sudo nmcli connection add type ethernet ifname {self.primary_if} "
+                             f"con-name {temp_conn_name} ipv4.method auto autoconnect no")
+
+            # Try to connect and get DHCP
+            print("[*] Testing DHCP connection...")
+            self.run_command(f"sudo nmcli connection up {temp_conn_name}")
+
+            # Wait a bit for DHCP
+            time.sleep(5)
+
+            # Check if we got an IP
+            result = self.run_command(f"ip addr show {self.primary_if}")
+            has_dhcp_ip = False
+            dhcp_ip = None
+
+            for line in result.stdout.split('\n'):
+                if 'inet ' in line and '127.0.0.1' not in line:
+                    ip_info = line.strip().split()[1]
+                    if not ip_info.startswith('169.254'):  # Not link-local
+                        has_dhcp_ip = True
+                        dhcp_ip = ip_info.split('/')[0]
+                        break
+
+            # Clean up temp connection
+            self.run_command(f"sudo nmcli connection delete {temp_conn_name}")
+
+            if has_dhcp_ip:
+                print(f"[+] DHCP detected! Got IP: {dhcp_ip}")
+                return "lan", dhcp_ip
+            else:
+                print("[*] No DHCP server detected")
+                return "direct", None
+
+        except subprocess.CalledProcessError:
+            # Clean up temp connection if it exists
+            try:
+                self.run_command(f"sudo nmcli connection delete {temp_conn_name}", check=False)
+            except:
+                pass
+            print("[*] DHCP test failed - assuming direct connection")
+            return "direct", None
+
+    def setup_lan_bridge(self, dhcp_ip):
+        """Set up bridge for LAN environment with DHCP"""
+        print("\n[*] Setting up LAN bridge configuration...")
+
+        # Extract network info from DHCP IP
+        ip_parts = dhcp_ip.split('.')
+        network_base = f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}"
+
+        # Create bridge with DHCP
+        print(f"[*] Creating bridge '{self.bridge_name}' with DHCP...")
+        self.run_command(f"sudo nmcli connection add type bridge ifname {self.bridge_name} "
+                         f"con-name {self.bridge_name} ipv4.method auto autoconnect yes")
+
+        # Add ethernet as slave
+        print(f"[*] Adding interface '{self.primary_if}' to bridge...")
+        self.run_command(f"sudo nmcli connection add type ethernet ifname {self.primary_if} "
+                         f"master {self.bridge_name} con-name {self.primary_if}-bridge-slave autoconnect yes")
+
+        # Activate bridge
+        print("[*] Activating bridge...")
+        self.run_command(f"sudo nmcli connection up {self.bridge_name}")
+
+        # Wait for DHCP
+        print("[*] Waiting for DHCP assignment...")
+        time.sleep(8)
+
+        # Get the actual IP assigned to bridge
+        result = self.run_command(f"ip addr show {self.bridge_name}")
+        bridge_ip = None
+
+        for line in result.stdout.split('\n'):
+            if 'inet ' in line and '127.0.0.1' not in line:
+                ip_info = line.strip().split()[1]
+                if not ip_info.startswith('169.254'):  # Not link-local
+                    bridge_ip = ip_info.split('/')[0]
+                    break
+
+        if bridge_ip:
+            print(f"[+] Bridge IP assigned: {bridge_ip}")
+            return bridge_ip, network_base
+        else:
+            print("[ERROR] Failed to get bridge IP from DHCP")
+            sys.exit(1)
+
+    def setup_direct_bridge(self):
+        """Set up bridge for direct connection between computers"""
+        print("\n[*] Setting up direct connection bridge...")
+
+        # Generate IP from MAC
+        local_ip = self.generate_ip_from_mac()
+
+        # Scan for existing hosts first
+        print("[*] Scanning for other computers on direct connection...")
+        detected_ips = self.scan_network_direct()
+
+        if detected_ips:
+            print(f"[+] Found {len(detected_ips)} existing computer(s): {', '.join(detected_ips)}")
+            # Check if our proposed IP conflicts
+            if local_ip in detected_ips:
+                local_ip = self.find_available_ip(detected_ips)
+                print(f"[*] IP conflict resolved, using: {local_ip}")
+        else:
+            print("[*] No other computers detected yet")
+
+        # Create bridge with static IP
+        print(f"[*] Creating bridge '{self.bridge_name}' with static IP {local_ip}...")
+        self.run_command(f"sudo nmcli connection add type bridge ifname {self.bridge_name} "
+                         f"con-name {self.bridge_name} ipv4.method manual "
+                         f"ipv4.addresses {local_ip}/24 autoconnect yes")
+
+        # Add ethernet as slave
+        print(f"[*] Adding interface '{self.primary_if}' to bridge...")
+        self.run_command(f"sudo nmcli connection add type ethernet ifname {self.primary_if} "
+                         f"master {self.bridge_name} con-name {self.primary_if}-bridge-slave autoconnect yes")
+
+        # Activate bridge
+        print("[*] Activating bridge...")
+        self.run_command(f"sudo nmcli connection up {self.bridge_name}")
+
+        # Wait for bridge to initialize
+        print("[*] Waiting for bridge to initialize...")
+        time.sleep(3)
+
+        return local_ip, "192.168.200"
 
     def generate_ip_from_mac(self):
         """Generate IP address based on MAC address"""
@@ -101,7 +289,7 @@ class NetworkSetup:
         except subprocess.CalledProcessError:
             return False
 
-    def ping_ip(self, ip, timeout=0.1):
+    def ping_ip(self, ip, timeout=0.5):
         """Ping a single IP address"""
         try:
             subprocess.run(f"ping -c1 -W{timeout} {ip}",
@@ -110,20 +298,27 @@ class NetworkSetup:
         except subprocess.CalledProcessError:
             return None
 
-    def scan_network(self, show_progress=True):
-        """Scan network for existing hosts using parallel ping"""
-        if show_progress:
-            print("[*] Scanning network for other computers...")
-
+    def scan_network_direct(self):
+        """Scan direct connection network (192.168.200.x)"""
+        print("[*] Scanning for other computers on direct connection...")
         network_base = "192.168.200"
         ips_to_scan = [f"{network_base}.{i}" for i in range(10, 251)]
+
+        return self.parallel_ping_scan(ips_to_scan)
+
+    def scan_network_lan(self, network_base):
+        """Scan LAN network"""
+        print(f"[*] Scanning LAN network {network_base}.x...")
+        ips_to_scan = [f"{network_base}.{i}" for i in range(1, 255)]
+
+        return self.parallel_ping_scan(ips_to_scan)
+
+    def parallel_ping_scan(self, ips_to_scan):
+        """Perform parallel ping scan"""
         found_ips = []
 
         # Use ThreadPoolExecutor for parallel pinging
         with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
-            if show_progress:
-                print("[*] Starting parallel scan...")
-
             # Submit all ping tasks
             future_to_ip = {executor.submit(self.ping_ip, ip): ip for ip in ips_to_scan}
 
@@ -136,28 +331,17 @@ class NetworkSetup:
 
                 if result:
                     found_ips.append(result)
-                    if show_progress:
-                        print(f"\r[*] Scanning... {completed}/{total} - Found: {len(found_ips)}",
-                              end="", flush=True)
-                elif show_progress and completed % 20 == 0:
+                    print(f"\r[*] Scanning... {completed}/{total} - Found: {len(found_ips)}",
+                          end="", flush=True)
+                elif completed % 50 == 0:
                     print(f"\r[*] Scanning... {completed}/{total} - Found: {len(found_ips)}",
                           end="", flush=True)
 
-        if show_progress:
-            print()  # New line
-
-        print (f"FOUND IPs {found_ips}")
+        print()  # New line
         return sorted(found_ips)
 
     def find_available_ip(self, detected_ips):
         """Find an available IP address"""
-        proposed_ip = self.generate_ip_from_mac()
-
-        if proposed_ip not in detected_ips:
-            return proposed_ip
-
-        print(f"[!] IP conflict detected with {proposed_ip}. Finding alternative...")
-
         # Find next available IP
         for i in range(10, 251):
             test_ip = f"192.168.200.{i}"
@@ -181,12 +365,12 @@ class NetworkSetup:
             print("[*] Detected ufw firewall")
 
             self.run_command(f"sudo ufw allow in on {self.bridge_name}")
-            self.run_command(f"sudo ufw allow in on {self.primary_if}")
+            self.run_command(f"sudo ufw allow out on {self.bridge_name}")
 
             with open(FIREWALL_STATUS_FILE, 'w') as f:
                 f.write("ufw")
 
-            print(f"[+] ufw rules added to allow all traffic on {self.bridge_name} and {self.primary_if}")
+            print(f"[+] ufw rules added to allow all traffic on {self.bridge_name}")
             return
         except subprocess.CalledProcessError:
             pass
@@ -197,20 +381,19 @@ class NetworkSetup:
             print("[*] Detected firewalld")
 
             self.run_command(f"sudo firewall-cmd --permanent --zone=trusted --add-interface={self.bridge_name}")
-            self.run_command(f"sudo firewall-cmd --permanent --zone=trusted --add-interface={self.primary_if}")
             self.run_command("sudo firewall-cmd --reload")
 
             with open(FIREWALL_STATUS_FILE, 'w') as f:
                 f.write("firewalld")
 
-            print(f"[+] firewalld rules added to allow all traffic on {self.bridge_name} and {self.primary_if}")
+            print(f"[+] firewalld rules added to allow all traffic on {self.bridge_name}")
             return
         except subprocess.CalledProcessError:
             pass
 
         print(f"[WARNING] No supported firewall (ufw or firewalld) detected. "
               f"If you have a manual configuration, you may need to allow traffic through "
-              f"{self.bridge_name} and {self.primary_if}.")
+              f"{self.bridge_name}.")
 
     def check_networkmanager(self):
         """Check and install NetworkManager if needed"""
@@ -226,12 +409,7 @@ class NetworkSetup:
         try:
             self.run_command("pacman --version")
             print("[*] Detected pacman-based system")
-
-            try:
-                self.run_command("pacman -Q networkmanager")
-                print("[+] networkmanager already installed.")
-            except subprocess.CalledProcessError:
-                self.run_command("sudo pacman -S --noconfirm networkmanager")
+            self.run_command("sudo pacman -S --noconfirm networkmanager")
         except subprocess.CalledProcessError:
             pass
 
@@ -239,12 +417,7 @@ class NetworkSetup:
         try:
             self.run_command("apt-get --version")
             print("[*] Detected apt-based system")
-
-            try:
-                self.run_command("dpkg -s network-manager")
-                print("[+] network-manager already installed.")
-            except subprocess.CalledProcessError:
-                self.run_command("sudo apt-get install -y network-manager")
+            self.run_command("sudo apt-get update && sudo apt-get install -y network-manager")
         except subprocess.CalledProcessError:
             print("[ERROR] Unsupported package manager. Only pacman and apt-get are supported.")
             sys.exit(1)
@@ -253,18 +426,26 @@ class NetworkSetup:
         try:
             self.run_command("systemctl is-active --quiet NetworkManager")
         except subprocess.CalledProcessError:
+            self.run_command("sudo systemctl enable NetworkManager")
             self.run_command("sudo systemctl start NetworkManager")
-            time.sleep(2)
+            time.sleep(3)
 
-    def test_connectivity(self, ips):
+    def test_connectivity(self, ips, our_ip):
         """Test connectivity to remote IPs"""
         if not ips:
             return 0
 
-        print("[*] Testing connectivity...")
+        print("[*] Testing connectivity to other computers...")
         reachable = 0
 
-        for remote_ip in ips:
+        # Filter out our own IP
+        remote_ips = [ip for ip in ips if ip != our_ip]
+
+        if not remote_ips:
+            print("[*] No remote computers to test")
+            return 0
+
+        for remote_ip in remote_ips:
             print(f"    Testing {remote_ip}... ", end="", flush=True)
             if self.ping_ip(remote_ip, timeout=2):
                 print("CONNECTED")
@@ -282,6 +463,7 @@ class NetworkSetup:
         print()
 
         self.check_sudo()
+        self.check_networkmanager()
 
         # Check if bridge already exists
         if self.bridge_exists():
@@ -292,107 +474,65 @@ class NetworkSetup:
                 result = self.run_command(f"ip addr show {self.bridge_name}")
                 current_ip = None
                 for line in result.stdout.split('\n'):
-                    if 'inet ' in line:
-                        current_ip = line.split()[1].split('/')[0]
+                    if 'inet ' in line and '127.0.0.1' not in line:
+                        current_ip = line.strip().split()[1].split('/')[0]
                         break
 
                 if current_ip:
-                    print(f"[*] Current IP: {current_ip}")
+                    print(f"[*] Current bridge IP: {current_ip}")
 
-                    # Scan for remote computers
-                    remote_ips = self.scan_network()
-
-                    # Filter out our own IP
-                    filtered_ips = [ip for ip in remote_ips if ip != current_ip]
-
-                    if filtered_ips:
-                        print(f"[+] Found {len(filtered_ips)} remote computer(s): {', '.join(filtered_ips)}")
-                        reachable = self.test_connectivity(filtered_ips)
-                        print(f"[+] Network ready! Connected to {reachable} remote computer(s)")
+                    # Determine network type and scan accordingly
+                    if current_ip.startswith('192.168.200'):
+                        # Direct connection
+                        remote_ips = self.scan_network_direct()
+                        network_type = "direct"
                     else:
-                        print("[!] No remote computers detected")
+                        # LAN connection
+                        network_base = '.'.join(current_ip.split('.')[:-1])
+                        remote_ips = self.scan_network_lan(network_base)
+                        network_type = "LAN"
+
+                    if remote_ips:
+                        reachable = self.test_connectivity(remote_ips, current_ip)
+                        print(f"[+] {network_type} network ready! Connected to {reachable} remote computer(s)")
+                    else:
+                        print(f"[!] No remote computers detected on {network_type} network")
                 else:
                     print("[ERROR] Could not determine current bridge IP")
             except Exception as e:
                 print(f"[ERROR] Failed to get bridge info: {e}")
 
             self.configure_firewall()
-
             print("\nNetwork is ready for use!")
             return
 
-        print("Setting up network configuration...")
-        print()
+        print("Setting up new network configuration...")
+        self.get_ethernet_interface()
+        self.cleanup_existing_connections()
 
-        self.check_networkmanager()
-        self.get_primary_interface()
+        # Detect network environment
+        network_type, dhcp_ip = self.detect_network_type()
+
+        if network_type == "lan":
+            print(f"\n[+] LAN environment detected with DHCP")
+            local_ip, network_base = self.setup_lan_bridge(dhcp_ip)
+            # Scan for other computers on LAN
+            remote_ips = self.scan_network_lan(network_base)
+        else:
+            print(f"\n[+] Direct connection environment detected")
+            local_ip, network_base = self.setup_direct_bridge()
+            # Scan for other computers on direct connection
+            remote_ips = self.scan_network_direct()
+
+        # Configure firewall
         self.configure_firewall()
 
-        # Scan network for existing hosts
-        detected_ips = self.scan_network()
-
-        if detected_ips:
-            print(f"[+] Found {len(detected_ips)} existing host(s): {', '.join(detected_ips)}")
+        # Test connectivity
+        if remote_ips:
+            reachable = self.test_connectivity(remote_ips, local_ip)
+            print(f"\n[+] Found {len(remote_ips)} computer(s), {reachable} reachable")
         else:
-            print("[!] No other hosts detected (they may not be configured yet)")
-
-        # Find available IP
-        local_ip = self.find_available_ip(detected_ips)
-        print(f"[*] Assigned IP: {local_ip}")
-
-        print()
-        print("[*] Network configuration:")
-        print(f"    Local IP: {local_ip}")
-        print(f"    Bridge: {self.bridge_name}")
-        print(f"    Interface: {self.primary_if}")
-        print()
-
-        confirm = input("Apply this network configuration? [Y/n]: ").lower()
-        if confirm == 'n':
-            print("Aborted.")
-            return
-
-        print("[*] Creating network bridge...")
-
-        # Create bridge
-        print(f"[*] Creating bridge '{self.bridge_name}'...")
-        self.run_command(f"sudo nmcli connection add type bridge ifname {self.bridge_name} "
-                         f"con-name {self.bridge_name} ipv4.method manual "
-                         f"ipv4.addresses {local_ip}/24 autoconnect yes")
-
-        # Add slave
-        print(f"[*] Adding interface '{self.primary_if}' to bridge...")
-        self.run_command(f"sudo nmcli connection add type ethernet ifname {self.primary_if} "
-                         f"master {self.bridge_name} con-name {self.primary_if}-slave autoconnect yes")
-
-        # Activate bridge
-        print("[*] Activating bridge...")
-        self.run_command(f"sudo nmcli connection up {self.bridge_name}")
-
-        # Wait for bridge to initialize
-        print("[*] Waiting for bridge to initialize...")
-        time.sleep(3)
-
-        # Verify bridge
-        try:
-            result = self.run_command(f"ip addr show {self.bridge_name}")
-            if f"{local_ip}/24" not in result.stdout:
-                print("[ERROR] Bridge verification failed")
-                sys.exit(1)
-        except Exception as e:
-            print(f"[ERROR] Bridge verification failed: {e}")
-            sys.exit(1)
-
-        print("[+] Bridge created successfully!")
-
-        # Test connectivity to existing hosts
-        if detected_ips:
-            reachable = self.test_connectivity(detected_ips)
-
-            if reachable > 0:
-                print(f"[+] Successfully connected to {reachable} remote computer(s)")
-            else:
-                print("[!] No remote computers reachable yet")
+            print(f"\n[*] No other computers detected (they may not be configured yet)")
 
         print()
         print("===============================================")
@@ -400,11 +540,12 @@ class NetworkSetup:
         print("===============================================")
         print()
         print("[+] Your computer is configured with:")
+        print(f"    • Network Type: {network_type.upper()}")
         print(f"    • IP Address: {local_ip}")
         print(f"    • Bridge Interface: {self.bridge_name}")
-        print(f"    • Primary Interface: {self.primary_if}")
-        if detected_ips:
-            print(f"    • Detected Computers: {', '.join(detected_ips)}")
+        print(f"    • Ethernet Interface: {self.primary_if}")
+        if remote_ips:
+            print(f"    • Detected Computers: {', '.join([ip for ip in remote_ips if ip != local_ip])}")
         print()
         print("Network is ready for use!")
 
@@ -418,7 +559,7 @@ def main():
         sys.exit(1)
     except Exception as e:
         print(f"[ERROR] Setup failed: {e}")
-        print("Run uninstall_bridge.sh to remove the bridge.")
+        print("You may need to clean up any partial configuration.")
         sys.exit(1)
 
 
