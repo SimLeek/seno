@@ -8,6 +8,7 @@ import logging
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Any
 from ortools.sat.python import cp_model
+from collections import defaultdict
 
 # Setup logging
 logging.basicConfig(
@@ -103,6 +104,12 @@ class StartupPongMessage:
     type: str
     id: str
 
+@dataclass
+class ScheduleHashMessage:
+    type: str
+    sender: str
+    fingerprint: str  # Changed from hash to fingerprint
+    assignment: Dict[str, str]  # Add the actual assignment for verification
 
 # Load configuration
 with open("config.json", "r") as f:
@@ -141,6 +148,10 @@ current_schedule = None
 startup_responses = {}
 orchestration_started = False
 
+schedule_agreement_lock = threading.Lock()
+schedule_fingerprints = {}
+schedule_agreement_event = threading.Event()
+
 def get_local_resources() -> Machine:
     """Gather local resource information."""
     return MACHINES[LOCAL_ID]
@@ -157,8 +168,8 @@ def can_run(program: Program, machine: Machine) -> bool:
 
 
 def compute_schedule(
-    machines: List[Machine], programs: List[Program]
-) -> Dict[str, str]:
+        machines: List[Machine], programs: List[Program]
+) -> tuple[Dict[str, str], str]:
     """Compute optimal program assignment using OR-Tools."""
     model = cp_model.CpModel()
     x = {}
@@ -250,6 +261,7 @@ def compute_schedule(
     solver = cp_model.CpSolver()
     solver.parameters.log_search_progress = True
     status = solver.Solve(model)
+
     if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
         assignment = {}
         unassigned = [p.name for p in programs if not p.run_on_all_machines]
@@ -261,11 +273,18 @@ def compute_schedule(
                     ] = m.id
                     if not p.run_on_all_machines and p.name in unassigned:
                         unassigned.remove(p.name)
+
         if unassigned:
             logger.warning(
                 f"Unassigned programs due to resource/device constraints: {', '.join(unassigned)}"
             )
-        return assignment
+
+        # Get the solution fingerprint
+        fingerprint = hashlib.md5((solver.solution_info()).encode())
+        logger.info(f"Solution fingerprint: {fingerprint}")
+        logger.info(f"Computed assignment: {assignment}")
+
+        return assignment, fingerprint
     else:
         logger.error(f"Scheduling failed. Status: {solver.StatusName(status)}")
         for m in machines:
@@ -276,7 +295,7 @@ def compute_schedule(
             logger.info(
                 f"Program {p.name}: CPU={p.cpu_cores}, RAM={p.ram_gb}, VRAM={p.vram_gb}, Devices={p.required_devices}, RunOnAll={p.run_on_all_machines}"
             )
-        return {}
+        return {}, ""
 
 
 def broadcast(message: Any):
@@ -308,30 +327,41 @@ def receive_messages():
 
 def handle_message(message: Dict[str, Any]):
     """Handle incoming messages."""
-    global current_schedule
+    global current_schedule, schedule_fingerprints
     msg_type = message.get("type")
-    #if msg_type == "resource":
-    #    message_data = {k: v for k, v in message.items() if k != "type"}
-    #    if "gpus" in message_data:
-    #        message_data["gpus"] = [GPU(**gpu) for gpu in message_data["gpus"]]
-    #    if "network" in message_data:
-    #        message_data["network"] = NetworkConfig(**message_data["network"])
-    #    resource_view[message["id"]] = Machine(**message_data)
-    #    if current_schedule is not None:
-    #        logger.info(f"Schedule exists despite new machine. Reintegrated machine {message['id']} into resource_view")
-    #        current_schedule = None
-    #        schedule_computer()
+
     if msg_type == "schedule_hash":
-        schedule_hashes[message["sender"]] = message["hash"]
+        with schedule_agreement_lock:
+            sender = message["sender"]
+            fingerprint = message["fingerprint"]
+            assignment = message["assignment"]
+
+            logger.info(f"Received schedule from {sender}: fingerprint={fingerprint}")
+            logger.debug(f"Received assignment from {sender}: {assignment}")
+
+            schedule_fingerprints[sender] = {
+                "fingerprint": fingerprint,
+                "assignment": assignment,
+                "timestamp": time.time()
+            }
+
+            # Check if we have responses from all expected machines
+            expected_machines = set(m.id for m in MACHINES.values() if m.id != LOCAL_ID)
+            received_machines = set(schedule_fingerprints.keys())
+
+            if expected_machines.issubset(received_machines):
+                logger.info("Received schedule responses from all machines")
+                schedule_agreement_event.set()
+
     elif msg_type == "heartbeat":
         heartbeats[message["id"]] = time.time()
-        #logger.info(f"Received heartbeat from {message['id']}")
         # Reintegrate machine if it was previously removed
         if message["id"] not in resource_view and message["id"] in MACHINES and current_schedule is not None:
             resource_view[message["id"]] = MACHINES[message["id"]]
             logger.info(f"Reintegrated machine {message['id']} into resource_view")
             current_schedule = None
             schedule_computer()
+
     elif msg_type == "startup_ping":
         pong_msg = StartupPongMessage(type="startup_pong", id=LOCAL_ID)
         try:
@@ -341,6 +371,7 @@ def handle_message(message: Dict[str, Any]):
             sock.close()
         except Exception as e:
             logger.error(f"Failed to send pong to {message['id']}: {e}")
+
     elif msg_type == "startup_pong":
         startup_responses[message["id"]] = time.time()
 
@@ -422,35 +453,97 @@ def wait_for_all_machines():
 
 def schedule_computer():
     """Compute and agree on schedule once at startup."""
-    global current_schedule
+    global current_schedule, schedule_fingerprints
+
     if not resource_view:
         logger.error("No machines available for scheduling")
         return
-    assignment = compute_schedule(list(resource_view.values()), PROGRAMS)
-    if assignment:
-        schedule_str = json.dumps(assignment, sort_keys=True)
-        schedule_hash = hashlib.sha256(schedule_str.encode()).hexdigest()
-        broadcast(
-            ScheduleHashMessage(
-                type="schedule_hash", sender=LOCAL_ID, hash=schedule_hash
-            )
+
+    logger.info("Starting schedule computation...")
+    logger.info(f"Available machines: {list(resource_view.keys())}")
+
+    # Compute schedule locally
+    assignment, fingerprint = compute_schedule(list(resource_view.values()), PROGRAMS)
+
+    if not assignment or not fingerprint:
+        logger.error("Failed to compute schedule")
+        return
+
+    # Reset agreement tracking
+    with schedule_agreement_lock:
+        schedule_fingerprints.clear()
+        schedule_agreement_event.clear()
+
+    # Broadcast our schedule
+    logger.info(f"Broadcasting schedule: fingerprint={fingerprint}")
+    broadcast(
+        ScheduleHashMessage(
+            type="schedule_hash",
+            sender=LOCAL_ID,
+            fingerprint=fingerprint,
+            assignment=assignment
         )
-        time.sleep(2)
-        hash_counts = {}
-        for h in schedule_hashes.values():
-            hash_counts[h] = hash_counts.get(h, 0) + 1
-        majority_hash = max(hash_counts.items(), key=lambda x: x[1], default=(None, 0))[
-            0
-        ]
-        if (
-            majority_hash == schedule_hash
-            and hash_counts.get(majority_hash, 0) > len(MACHINES) // 2
-        ):
+    )
+
+    # Wait for responses from all machines (with timeout)
+    logger.info("Waiting for schedule responses from other machines...")
+    agreement_reached = schedule_agreement_event.wait(timeout=10.0)
+
+    if not agreement_reached:
+        logger.error("Timeout waiting for schedule responses")
+        return
+
+    # Analyze responses
+    with schedule_agreement_lock:
+        logger.info("Analyzing schedule agreement...")
+
+        # Count fingerprints (including our own)
+        fingerprint_counts = defaultdict(int)
+        fingerprint_counts[fingerprint] += 1  # Count our own
+
+        assignments_by_fingerprint = defaultdict(list)
+        assignments_by_fingerprint[fingerprint].append(f"{LOCAL_ID}(local)")
+
+        for sender, data in schedule_fingerprints.items():
+            fp = data["fingerprint"]
+            fingerprint_counts[fp] += 1
+            assignments_by_fingerprint[fp].append(sender)
+
+        logger.info(f"Fingerprint counts: {dict(fingerprint_counts)}")
+
+        # Find majority
+        total_machines = len(MACHINES)
+        majority_threshold = total_machines // 2 + 1
+
+        majority_fingerprint = None
+        for fp, count in fingerprint_counts.items():
+            logger.info(f"Fingerprint {fp}: {count}/{total_machines} machines")
+            if count >= majority_threshold:
+                majority_fingerprint = fp
+                break
+
+        if majority_fingerprint == fingerprint:
+            logger.info(f"✓ Schedule agreement reached! Fingerprint: {majority_fingerprint}")
+            logger.info(f"  Agreeing machines: {assignments_by_fingerprint[majority_fingerprint]}")
             current_schedule = assignment
-            logger.info(f"Schedule agreed: {assignment}")
+            logger.info(f"  Final schedule: {assignment}")
         else:
-            logger.error("No majority agreement on schedule")
-        schedule_hashes.clear()
+            logger.error("✗ No majority agreement on schedule")
+            if majority_fingerprint:
+                logger.error(f"  Majority fingerprint: {majority_fingerprint}")
+                logger.error(f"  Our fingerprint: {fingerprint}")
+                logger.error(f"  Majority machines: {assignments_by_fingerprint[majority_fingerprint]}")
+            else:
+                logger.error("  No fingerprint achieved majority")
+
+            # Debug: Show all assignments
+            logger.error("  All received assignments:")
+            logger.error(f"    {LOCAL_ID}(local): {assignment}")
+            for sender, data in schedule_fingerprints.items():
+                logger.error(f"    {sender}: {data['assignment']}")
+
+        # Clear fingerprints for next round
+        schedule_fingerprints.clear()
 
 
 def program_manager():
