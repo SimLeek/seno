@@ -142,7 +142,10 @@ def can_run(program: Program, machine: Machine) -> bool:
     """Check if a program can run on a machine based on device requirements."""
     required_devices = set(program.required_devices)
     available_devices = set(machine.devices)
-    return required_devices.issubset(available_devices)
+    yes_can_run = required_devices.issubset(available_devices)
+    if not yes_can_run:
+        print(f"p{program.name},m{machine.id} cannot run. missing requirements: {required_devices.difference(available_devices)}")
+    return yes_can_run
 
 
 def compute_schedule(
@@ -159,7 +162,6 @@ def compute_schedule(
                 x[(p.name, m.id)] = model.NewBoolVar(f"x_{p.name}_{m.id}")
 
     # Constraints
-    # Each program assigned to at most one machine, unless run_on_all_machines
     for p in programs:
         if p.run_on_all_machines:
             for m in machines:
@@ -170,12 +172,14 @@ def compute_schedule(
                 sum(x[(p.name, m.id)] for m in machines if (p.name, m.id) in x) <= 1
             )
 
-    # Priority 100 programs must be assigned (if not run_on_all_machines)
+    # Priority 100 programs must be assigned if compatible machine exists
     for p in programs:
         if p.priority == 100 and not p.run_on_all_machines:
-            model.Add(
-                sum(x[(p.name, m.id)] for m in machines if (p.name, m.id) in x) == 1
-            )
+            compatible_machines = [m for m in machines if can_run(p, m)]
+            if compatible_machines:
+                model.Add(
+                    sum(x[(p.name, m.id)] for m in machines if (p.name, m.id) in x) == 1
+                )
 
     # Resource constraints per machine
     for m in machines:
@@ -251,7 +255,6 @@ def compute_schedule(
                     ] = m.id
                     if not p.run_on_all_machines and p.name in unassigned:
                         unassigned.remove(p.name)
-        # Log unassigned programs
         if unassigned:
             logger.warning(
                 f"Unassigned programs due to resource/device constraints: {', '.join(unassigned)}"
@@ -259,7 +262,6 @@ def compute_schedule(
         return assignment
     else:
         logger.error(f"Scheduling failed. Status: {solver.StatusName(status)}")
-        # Log resource usage
         for m in machines:
             logger.info(
                 f"Machine {m.id}: CPU={m.cpu_cores}, RAM={m.ram_gb}, VRAM={m.vram_gb}, Devices={m.devices}"
@@ -313,7 +315,6 @@ def handle_message(message: Dict[str, Any]):
         heartbeats[message["id"]] = time.time()
         logger.info(f"Received heartbeat from {message['id']}")
     elif msg_type == "startup_ping":
-        # Respond to startup ping with pong
         pong_msg = StartupPongMessage(type="startup_pong", id=LOCAL_ID)
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -323,7 +324,6 @@ def handle_message(message: Dict[str, Any]):
         except Exception as e:
             logger.error(f"Failed to send pong to {message['id']}: {e}")
     elif msg_type == "startup_pong":
-        # Record that this machine is online
         startup_responses[message["id"]] = time.time()
 
 
@@ -358,37 +358,25 @@ def wait_for_all_machines():
     timeout = 60
 
     while time.time() - start_time < timeout:
-        # Send ping to all other machines
         ping_msg = StartupPingMessage(type="startup_ping", id=LOCAL_ID)
         broadcast(ping_msg)
-
-        # Check if all machines have responded
         expected_machines = set(m.id for m in MACHINES.values() if m.id != LOCAL_ID)
         responding_machines = set(startup_responses.keys())
-
         if expected_machines.issubset(responding_machines):
             logger.info("All machines are online! Proceeding with orchestration.")
             return True
-
         missing_machines = expected_machines - responding_machines
         logger.info(f"Still waiting for machines: {list(missing_machines)}")
-
-        time.sleep(1)  # Wait 1 second before next ping
-
-    # Timeout reached
+        time.sleep(1)
     responding_machines = set(startup_responses.keys())
     expected_machines = set(m.id for m in MACHINES.values() if m.id != LOCAL_ID)
     missing_machines = expected_machines - responding_machines
-
     if missing_machines:
         logger.warning(f"Timeout reached. Missing machines: {list(missing_machines)}")
         logger.warning("Proceeding with available machines only.")
-
-        # Update MACHINES to only include responding machines + local machine
         available_machine_ids = responding_machines | {LOCAL_ID}
         MACHINES = {k: v for k, v in MACHINES.items() if k in available_machine_ids}
         logger.info(f"Updated machine list: {list(MACHINES.keys())}")
-
     return True
 
 
@@ -427,6 +415,9 @@ def resource_monitor():
 def schedule_computer():
     """Compute and agree on schedule once at startup."""
     global current_schedule
+    if not resource_view:
+        logger.error("No machines available for scheduling")
+        return
     assignment = compute_schedule(list(resource_view.values()), PROGRAMS)
     if assignment:
         schedule_str = json.dumps(assignment, sort_keys=True)
@@ -459,7 +450,6 @@ def program_manager():
     global running_programs
     while True:
         if orchestration_started and current_schedule:
-            # Check for crashed or ended programs
             for prog_name, proc in list(running_programs.items()):
                 if proc and proc.poll() is not None:
                     return_code = proc.return_code
@@ -489,7 +479,6 @@ def program_manager():
                     else:
                         stop_program(proc)
                         del running_programs[prog_name]
-            # Start new programs assigned to this machine
             for prog in PROGRAMS:
                 if prog.run_on_all_machines:
                     prog_key = f"{prog.name}_{LOCAL_ID}"
@@ -533,37 +522,23 @@ def heartbeat_monitor():
                     heartbeats.pop(machine_id, None)
                     global current_schedule
                     current_schedule = None
-                    schedule_computer()  # Recompute schedule on failure
-        time.sleep(0.2)  # 5 checks per second
+                    schedule_computer()
+        time.sleep(0.2)
 
 
 def main():
     """Main function to start all threads."""
     global orchestration_started, resource_view, heartbeats
-
-    # Start the message receiver first
     threading.Thread(target=receive_messages, daemon=True).start()
-
-    # Wait for all machines to be online
     wait_for_all_machines()
-
-    # Initialize global state with available machines
     resource_view = {m.id: m for m in MACHINES.values()}
     heartbeats = {m.id: time.time() for m in MACHINES.values()}
-
-    # Start all orchestration threads
     threading.Thread(target=resource_monitor, daemon=True).start()
     threading.Thread(target=program_manager, daemon=True).start()
     threading.Thread(target=heartbeat_sender, daemon=True).start()
     threading.Thread(target=heartbeat_monitor, daemon=True).start()
-
-    # Mark orchestration as started
     orchestration_started = True
-
-    # Compute initial schedule
     schedule_computer()
-
-    # Keep main thread alive
     while True:
         time.sleep(1)
 
