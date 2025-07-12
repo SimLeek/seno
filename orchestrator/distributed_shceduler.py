@@ -132,6 +132,7 @@ LOCAL_ID = CONFIG["local_id"]
 resource_view = {}
 heartbeats = {}
 running_programs = {}
+completed_programs = set()  # Track programs that ended naturally (exit code 0)
 current_schedule = None
 startup_responses = {}
 orchestration_started = False
@@ -483,7 +484,7 @@ def wait_for_all_machines():
 
 def schedule_computer():
     """Compute and agree on schedule using two-phase protocol."""
-    global current_schedule
+    global current_schedule  #, completed_programs
 
     if not resource_view:
         logger.error("No machines available for scheduling")
@@ -491,6 +492,9 @@ def schedule_computer():
 
     logger.info("Starting schedule computation...")
     logger.info(f"Available machines: {list(resource_view.keys())}")
+
+    # Clear completed programs for new schedule
+    # completed_programs.clear()
 
     # Compute schedule locally
     assignment, fingerprint = compute_schedule(list(resource_view.values()), PROGRAMS)
@@ -591,6 +595,7 @@ def program_manager():
                     ):
                         if return_code == 0:
                             logger.info(f"Program {prog_name} ended naturally")
+                            completed_programs.add(prog_name)
                         else:
                             logger.warning(
                                 f"Program {prog_name} crashed with code {return_code}, restarting"
@@ -615,6 +620,7 @@ def program_manager():
                     if (
                         current_schedule.get(prog_key) == LOCAL_ID
                         and prog_key not in running_programs
+                        and prog_key not in completed_programs
                     ):
                         proc = run_program(prog.path)
                         if proc:
@@ -624,6 +630,7 @@ def program_manager():
                     if (
                         current_schedule.get(prog.name) == LOCAL_ID
                         and prog.name not in running_programs
+                        and prog.name not in completed_programs
                     ):
                         proc = run_program(prog.path)
                         if proc:
