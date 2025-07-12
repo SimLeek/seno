@@ -46,6 +46,7 @@ class NetworkTest:
         # Get password for sudo
         print("[*] This script requires sudo privileges.")
         import getpass
+
         self.sudo_password = getpass.getpass("Enter sudo password: ")
 
     def run_command(self, cmd, check=True, capture_output=True):
@@ -55,11 +56,21 @@ class NetworkTest:
             if cmd.startswith("sudo ") and self.sudo_password:
                 # Use echo to pipe password to sudo -S
                 full_cmd = f"echo '{self.sudo_password}' | sudo -S {cmd[5:]}"
-                result = subprocess.run(full_cmd, shell=True, check=check,
-                                        capture_output=capture_output, text=True)
+                result = subprocess.run(
+                    full_cmd,
+                    shell=True,
+                    check=check,
+                    capture_output=capture_output,
+                    text=True,
+                )
             else:
-                result = subprocess.run(cmd, shell=True, check=check,
-                                        capture_output=capture_output, text=True)
+                result = subprocess.run(
+                    cmd,
+                    shell=True,
+                    check=check,
+                    capture_output=capture_output,
+                    text=True,
+                )
             return result
         except subprocess.CalledProcessError as e:
             if check:
@@ -72,12 +83,14 @@ class NetworkTest:
         """Get current bridge IP"""
         try:
             result = self.run_command(f"ip addr show {self.bridge_name}")
-            for line in result.stdout.split('\n'):
-                if 'inet ' in line and not line.strip().startswith('inet6'):
-                    self.current_ip = line.split()[1].split('/')[0]
+            for line in result.stdout.split("\n"):
+                if "inet " in line and not line.strip().startswith("inet6"):
+                    self.current_ip = line.split()[1].split("/")[0]
                     return self.current_ip
 
-            print(f"[ERROR] Failed to retrieve current bridge IP. Ensure bridge '{self.bridge_name}' is configured.")
+            print(
+                f"[ERROR] Failed to retrieve current bridge IP. Ensure bridge '{self.bridge_name}' is configured."
+            )
             sys.exit(1)
         except Exception as e:
             print(f"[ERROR] Failed to get bridge info: {e}")
@@ -86,8 +99,12 @@ class NetworkTest:
     def ping_ip(self, ip, timeout=1):
         """Ping a single IP address"""
         try:
-            subprocess.run(f"ping -c1 -W{timeout} {ip}",
-                           shell=True, check=True, capture_output=True)
+            subprocess.run(
+                f"ping -c1 -W{timeout} {ip}",
+                shell=True,
+                check=True,
+                capture_output=True,
+            )
             return ip
         except subprocess.CalledProcessError:
             return None
@@ -116,11 +133,17 @@ class NetworkTest:
 
                 if result:
                     found_ips.append(result)
-                    print(f"\r[*] Scanning... {completed}/{total} - Found: {len(found_ips)}",
-                          end="", flush=True)
+                    print(
+                        f"\r[*] Scanning... {completed}/{total} - Found: {len(found_ips)}",
+                        end="",
+                        flush=True,
+                    )
                 elif completed % 20 == 0:
-                    print(f"\r[*] Scanning... {completed}/{total} - Found: {len(found_ips)}",
-                          end="", flush=True)
+                    print(
+                        f"\r[*] Scanning... {completed}/{total} - Found: {len(found_ips)}",
+                        end="",
+                        flush=True,
+                    )
 
         print()  # New line
         return sorted(found_ips)
@@ -130,7 +153,7 @@ class NetworkTest:
         try:
             self.listener_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.listener_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.listener_socket.bind(('', self.port))
+            self.listener_socket.bind(("", self.port))
             self.listener_socket.listen(5)
             self.listener_socket.settimeout(1)  # Non-blocking with timeout
 
@@ -179,7 +202,9 @@ class NetworkTest:
 
         # Start listener in background thread
         print(f"[*] Starting listener on port {self.port}...")
-        self.listener_thread = threading.Thread(target=self.message_listener, daemon=True)
+        self.listener_thread = threading.Thread(
+            target=self.message_listener, daemon=True
+        )
         self.listener_thread.start()
         time.sleep(1)  # Give listener time to start
 
@@ -190,11 +215,15 @@ class NetworkTest:
         filtered_ips = [ip for ip in remote_ips if ip != self.current_ip]
 
         if filtered_ips:
-            print(f"[+] Found {len(filtered_ips)} remote computer(s): {', '.join(filtered_ips)}")
+            print(
+                f"[+] Found {len(filtered_ips)} remote computer(s): {', '.join(filtered_ips)}"
+            )
 
             # Generate random number
             random_number = random.randint(1, 9999)
-            print(f"[*] Sending random number '{random_number}' to all other IPs on bridge...")
+            print(
+                f"[*] Sending random number '{random_number}' to all other IPs on bridge..."
+            )
 
             # Send random number to each remote IP
             for remote_ip in filtered_ips:

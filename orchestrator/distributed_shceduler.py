@@ -10,7 +10,9 @@ from typing import List, Dict, Any
 from ortools.sat.python import cp_model
 
 # Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 
@@ -67,7 +69,9 @@ class Program:
 class ResourceMessage:
     type: str
     id: str
+    ip: str
     cpu_cores: int
+    cpu_ghz: float
     ram_gb: int
     vram_gb: int
     gpus: List[Dict[str, Any]]
@@ -115,12 +119,17 @@ MACHINES = {
         vram_gb=v.get("vram_gb", 0),
         gpus=[GPU(**gpu) for gpu in v.get("gpus", [])],
         devices=v["devices"],
-        network=NetworkConfig(**v["network"])
-    ) for k, v in CONFIG["machines"].items()
+        network=NetworkConfig(**v["network"]),
+    )
+    for k, v in CONFIG["machines"].items()
 }
-PROGRAMS = [Program(**{k: v for k, v in prog.items() if k != "run_on_all_machines"},
-                    run_on_all_machines=prog.get("run_on_all_machines", False))
-            for prog in CONFIG["programs"]]
+PROGRAMS = [
+    Program(
+        **{k: v for k, v in prog.items() if k != "run_on_all_machines"},
+        run_on_all_machines=prog.get("run_on_all_machines", False),
+    )
+    for prog in CONFIG["programs"]
+]
 LOCAL_ID = CONFIG["local_id"]
 
 
@@ -136,7 +145,9 @@ def can_run(program: Program, machine: Machine) -> bool:
     return required_devices.issubset(available_devices)
 
 
-def compute_schedule(machines: List[Machine], programs: List[Program]) -> Dict[str, str]:
+def compute_schedule(
+    machines: List[Machine], programs: List[Program]
+) -> Dict[str, str]:
     """Compute optimal program assignment using OR-Tools."""
     model = cp_model.CpModel()
     x = {}
@@ -155,39 +166,64 @@ def compute_schedule(machines: List[Machine], programs: List[Program]) -> Dict[s
                 if can_run(p, m):
                     model.Add(x[(p.name, m.id)] == 1)
         else:
-            model.Add(sum(x[(p.name, m.id)] for m in machines if (p.name, m.id) in x) <= 1)
+            model.Add(
+                sum(x[(p.name, m.id)] for m in machines if (p.name, m.id) in x) <= 1
+            )
 
     # Priority 100 programs must be assigned (if not run_on_all_machines)
     for p in programs:
         if p.priority == 100 and not p.run_on_all_machines:
-            model.Add(sum(x[(p.name, m.id)] for m in machines if (p.name, m.id) in x) == 1)
+            model.Add(
+                sum(x[(p.name, m.id)] for m in machines if (p.name, m.id) in x) == 1
+            )
 
     # Resource constraints per machine
     for m in machines:
         # CPU cores
         model.Add(
-            sum(x[(p.name, m.id)] * int(p.cpu_cores) for p in programs if (p.name, m.id) in x)
+            sum(
+                x[(p.name, m.id)] * int(p.cpu_cores)
+                for p in programs
+                if (p.name, m.id) in x
+            )
             <= m.cpu_cores
         )
         # RAM
         model.Add(
-            sum(x[(p.name, m.id)] * int(p.ram_gb) for p in programs if (p.name, m.id) in x)
+            sum(
+                x[(p.name, m.id)] * int(p.ram_gb)
+                for p in programs
+                if (p.name, m.id) in x
+            )
             <= m.ram_gb
         )
-        # VRAM
-        model.Add(
-            sum(x[(p.name, m.id)] * int(p.vram_gb) for p in programs if (p.name, m.id) in x)
-            <= m.vram_gb
-        )
+        # VRAM (only apply if machine has VRAM)
+        if m.vram_gb > 0:
+            model.Add(
+                sum(
+                    x[(p.name, m.id)] * int(p.vram_gb)
+                    for p in programs
+                    if (p.name, m.id) in x
+                )
+                <= m.vram_gb
+            )
         # Network bandwidth
         model.Add(
-            sum(x[(p.name, m.id)] * int(p.network_bandwidth_bps) for p in programs if (p.name, m.id) in x)
+            sum(
+                x[(p.name, m.id)] * int(p.network_bandwidth_bps)
+                for p in programs
+                if (p.name, m.id) in x
+            )
             <= m.network.max_input_bandwidth_bps
         )
-        # GPUs (simplified: count programs requiring GPU)
+        # GPUs
         if m.gpus:
             model.Add(
-                sum(x[(p.name, m.id)] for p in programs if (p.name, m.id) in x and "gpu" in p.required_devices)
+                sum(
+                    x[(p.name, m.id)]
+                    for p in programs
+                    if (p.name, m.id) in x and "gpu" in p.required_devices
+                )
                 <= len(m.gpus)
             )
 
@@ -202,6 +238,7 @@ def compute_schedule(machines: List[Machine], programs: List[Program]) -> Dict[s
 
     # Solve
     solver = cp_model.CpSolver()
+    solver.parameters.log_search_progress = True
     status = solver.Solve(model)
     if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
         assignment = {}
@@ -209,21 +246,28 @@ def compute_schedule(machines: List[Machine], programs: List[Program]) -> Dict[s
         for p in programs:
             for m in machines:
                 if (p.name, m.id) in x and solver.Value(x[(p.name, m.id)]) > 0:
-                    assignment[f"{p.name}_{m.id}" if p.run_on_all_machines else p.name] = m.id
+                    assignment[
+                        f"{p.name}_{m.id}" if p.run_on_all_machines else p.name
+                    ] = m.id
                     if not p.run_on_all_machines and p.name in unassigned:
                         unassigned.remove(p.name)
         # Log unassigned programs
         if unassigned:
-            logger.warning(f"Unassigned programs due to resource/device constraints: {', '.join(unassigned)}")
+            logger.warning(
+                f"Unassigned programs due to resource/device constraints: {', '.join(unassigned)}"
+            )
         return assignment
     else:
         logger.error(f"Scheduling failed. Status: {solver.StatusName(status)}")
         # Log resource usage
         for m in machines:
-            logger.info(f"Machine {m.id}: CPU={m.cpu_cores}, RAM={m.ram_gb}, VRAM={m.vram_gb}, Devices={m.devices}")
+            logger.info(
+                f"Machine {m.id}: CPU={m.cpu_cores}, RAM={m.ram_gb}, VRAM={m.vram_gb}, Devices={m.devices}"
+            )
         for p in programs:
             logger.info(
-                f"Program {p.name}: CPU={p.cpu_cores}, RAM={p.ram_gb}, Devices={p.required_devices}, RunOnAll={p.run_on_all_machines}")
+                f"Program {p.name}: CPU={p.cpu_cores}, RAM={p.ram_gb}, VRAM={p.vram_gb}, Devices={p.required_devices}, RunOnAll={p.run_on_all_machines}"
+            )
         return {}
 
 
@@ -257,18 +301,17 @@ def handle_message(message: Dict[str, Any]):
     """Handle incoming messages."""
     msg_type = message.get("type")
     if msg_type == "resource":
-        # Filter out the 'type' field before creating Machine object
-        machine_data = {k: v for k, v in message.items() if k != "type"}
-        # Convert nested dictionaries back to dataclass objects
-        if "gpus" in machine_data:
-            machine_data["gpus"] = [GPU(**gpu) for gpu in machine_data["gpus"]]
-        if "network" in machine_data:
-            machine_data["network"] = NetworkConfig(**machine_data["network"])
-        resource_view[message["id"]] = Machine(**machine_data)
+        message_data = {k: v for k, v in message.items() if k != "type"}
+        if "gpus" in message_data:
+            message_data["gpus"] = [GPU(**gpu) for gpu in message_data["gpus"]]
+        if "network" in message_data:
+            message_data["network"] = NetworkConfig(**message_data["network"])
+        resource_view[message["id"]] = Machine(**message_data)
     elif msg_type == "schedule_hash":
         schedule_hashes[message["sender"]] = message["hash"]
     elif msg_type == "heartbeat":
         heartbeats[message["id"]] = time.time()
+        logger.info(f"Received heartbeat from {message['id']}")
     elif msg_type == "startup_ping":
         # Respond to startup ping with pong
         pong_msg = StartupPongMessage(type="startup_pong", id=LOCAL_ID)
@@ -312,7 +355,7 @@ def wait_for_all_machines():
     logger.info(f"Expected machines: {list(MACHINES.keys())}")
 
     start_time = time.time()
-    timeout = 60  # 1 minute timeout
+    timeout = 60
 
     while time.time() - start_time < timeout:
         # Send ping to all other machines
@@ -364,17 +407,21 @@ def resource_monitor():
     while True:
         if orchestration_started:
             resources = get_local_resources()
-            broadcast(ResourceMessage(
-                type="resource",
-                id=resources.id,
-                cpu_cores=resources.cpu_cores,
-                ram_gb=resources.ram_gb,
-                vram_gb=resources.vram_gb,
-                gpus=[asdict(gpu) for gpu in resources.gpus],
-                devices=resources.devices,
-                network=asdict(resources.network)
-            ))
-        time.sleep(0.2)  # 5 per second
+            broadcast(
+                ResourceMessage(
+                    type="resource",
+                    id=resources.id,
+                    ip=resources.ip,
+                    cpu_cores=resources.cpu_cores,
+                    cpu_ghz=resources.cpu_ghz,
+                    ram_gb=resources.ram_gb,
+                    vram_gb=resources.vram_gb,
+                    gpus=[asdict(gpu) for gpu in resources.gpus],
+                    devices=resources.devices,
+                    network=asdict(resources.network),
+                )
+            )
+        time.sleep(0.2)
 
 
 def schedule_computer():
@@ -384,18 +431,22 @@ def schedule_computer():
     if assignment:
         schedule_str = json.dumps(assignment, sort_keys=True)
         schedule_hash = hashlib.sha256(schedule_str.encode()).hexdigest()
-        broadcast(ScheduleHashMessage(
-            type="schedule_hash",
-            sender=LOCAL_ID,
-            hash=schedule_hash
-        ))
-        # Wait to collect hashes
+        broadcast(
+            ScheduleHashMessage(
+                type="schedule_hash", sender=LOCAL_ID, hash=schedule_hash
+            )
+        )
         time.sleep(2)
         hash_counts = {}
         for h in schedule_hashes.values():
             hash_counts[h] = hash_counts.get(h, 0) + 1
-        majority_hash = max(hash_counts.items(), key=lambda x: x[1], default=(None, 0))[0]
-        if majority_hash == schedule_hash and hash_counts.get(majority_hash, 0) > len(MACHINES) // 2:
+        majority_hash = max(hash_counts.items(), key=lambda x: x[1], default=(None, 0))[
+            0
+        ]
+        if (
+            majority_hash == schedule_hash
+            and hash_counts.get(majority_hash, 0) > len(MACHINES) // 2
+        ):
             current_schedule = assignment
             logger.info(f"Schedule agreed: {assignment}")
         else:
@@ -413,12 +464,24 @@ def program_manager():
                 if proc and proc.poll() is not None:
                     return_code = proc.return_code
                     logger.info(f"Program {prog_name} exited with code {return_code}")
-                    if prog_name in current_schedule and current_schedule[prog_name] == LOCAL_ID:
+                    if (
+                        prog_name in current_schedule
+                        and current_schedule[prog_name] == LOCAL_ID
+                    ):
                         if return_code == 0:
                             logger.info(f"Program {prog_name} ended naturally")
                         else:
-                            logger.warning(f"Program {prog_name} crashed with code {return_code}, restarting")
-                            prog = next((p for p in PROGRAMS if p.name == prog_name.split("_")[0]), None)
+                            logger.warning(
+                                f"Program {prog_name} crashed with code {return_code}, restarting"
+                            )
+                            prog = next(
+                                (
+                                    p
+                                    for p in PROGRAMS
+                                    if p.name == prog_name.split("_")[0]
+                                ),
+                                None,
+                            )
                             if prog:
                                 proc = run_program(prog.path)
                                 if proc:
@@ -430,18 +493,24 @@ def program_manager():
             for prog in PROGRAMS:
                 if prog.run_on_all_machines:
                     prog_key = f"{prog.name}_{LOCAL_ID}"
-                    if current_schedule.get(prog_key) == LOCAL_ID and prog_key not in running_programs:
+                    if (
+                        current_schedule.get(prog_key) == LOCAL_ID
+                        and prog_key not in running_programs
+                    ):
                         proc = run_program(prog.path)
                         if proc:
                             running_programs[prog_key] = proc
                             logger.info(f"Started program {prog_key}")
                 else:
-                    if current_schedule.get(prog.name) == LOCAL_ID and prog.name not in running_programs:
+                    if (
+                        current_schedule.get(prog.name) == LOCAL_ID
+                        and prog.name not in running_programs
+                    ):
                         proc = run_program(prog.path)
                         if proc:
                             running_programs[prog.name] = proc
                             logger.info(f"Started program {prog.name}")
-        time.sleep(0.2)  # 5 checks per second
+        time.sleep(0.2)
 
 
 def heartbeat_sender():
@@ -449,7 +518,7 @@ def heartbeat_sender():
     while True:
         if orchestration_started:
             broadcast(HeartbeatMessage(type="heartbeat", id=LOCAL_ID))
-        time.sleep(0.2)  # 5 per second
+        time.sleep(0.2)
 
 
 def heartbeat_monitor():

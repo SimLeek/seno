@@ -43,11 +43,21 @@ class NetworkUninstaller:
             if cmd.startswith("sudo ") and self.sudo_password:
                 # Use echo to pipe password to sudo -S
                 full_cmd = f"echo '{self.sudo_password}' | sudo -S {cmd[5:]}"
-                result = subprocess.run(full_cmd, shell=True, check=check,
-                                        capture_output=capture_output, text=True)
+                result = subprocess.run(
+                    full_cmd,
+                    shell=True,
+                    check=check,
+                    capture_output=capture_output,
+                    text=True,
+                )
             else:
-                result = subprocess.run(cmd, shell=True, check=check,
-                                        capture_output=capture_output, text=True)
+                result = subprocess.run(
+                    cmd,
+                    shell=True,
+                    check=check,
+                    capture_output=capture_output,
+                    text=True,
+                )
             return result
         except subprocess.CalledProcessError as e:
             if check:
@@ -60,19 +70,21 @@ class NetworkUninstaller:
         """Get primary interface from bridge"""
         try:
             result = self.run_command("nmcli connection show")
-            lines = result.stdout.strip().split('\n')
+            lines = result.stdout.strip().split("\n")
 
             for line in lines:
-                if self.bridge_name in line and 'ethernet' in line:
+                if self.bridge_name in line and "ethernet" in line:
                     # Extract interface name (first part before '-slave')
                     parts = line.split()
                     if len(parts) > 0:
                         conn_name = parts[0]
-                        if conn_name.endswith('-slave'):
-                            primary_if = conn_name.replace('-slave', '')
+                        if conn_name.endswith("-slave"):
+                            primary_if = conn_name.replace("-slave", "")
                             return primary_if
 
-            print(f"[WARNING] No enslaved Ethernet interface found for bridge '{self.bridge_name}'")
+            print(
+                f"[WARNING] No enslaved Ethernet interface found for bridge '{self.bridge_name}'"
+            )
             return None
         except Exception as e:
             print(f"[WARNING] Failed to get primary interface: {e}")
@@ -81,14 +93,18 @@ class NetworkUninstaller:
     def remove_firewall_rules(self, primary_if):
         """Remove firewall rules"""
         if not os.path.exists(self.firewall_status_file):
-            print("[*] No firewall status file found. Assuming no firewall rules were added.")
+            print(
+                "[*] No firewall status file found. Assuming no firewall rules were added."
+            )
             return
 
         try:
-            with open(self.firewall_status_file, 'r') as f:
+            with open(self.firewall_status_file, "r") as f:
                 firewall_type = f.read().strip()
         except Exception as e:
-            print(f"[WARNING] Failed to read firewall status file: {e}. Assuming no rules to remove.")
+            print(
+                f"[WARNING] Failed to read firewall status file: {e}. Assuming no rules to remove."
+            )
             return
 
         if firewall_type == "ufw":
@@ -98,30 +114,44 @@ class NetworkUninstaller:
             try:
                 self.run_command(f"sudo ufw delete allow in on {self.bridge_name}")
             except subprocess.CalledProcessError:
-                print(f"[WARNING] Failed to remove ufw rule for {self.bridge_name} (may not exist)")
+                print(
+                    f"[WARNING] Failed to remove ufw rule for {self.bridge_name} (may not exist)"
+                )
 
             # Remove ufw rule for primary interface
             try:
                 self.run_command(f"sudo ufw delete allow in on {primary_if}")
             except subprocess.CalledProcessError:
-                print(f"[WARNING] Failed to remove ufw rule for {primary_if} (may not exist)")
+                print(
+                    f"[WARNING] Failed to remove ufw rule for {primary_if} (may not exist)"
+                )
 
             print("[+] ufw rules removed")
 
         elif firewall_type == "firewalld":
-            print(f"[*] Removing firewalld rules for {self.bridge_name} and {primary_if}...")
+            print(
+                f"[*] Removing firewalld rules for {self.bridge_name} and {primary_if}..."
+            )
 
             # Remove firewalld rule for bridge
             try:
-                self.run_command(f"sudo firewall-cmd --permanent --zone=trusted --remove-interface={self.bridge_name}")
+                self.run_command(
+                    f"sudo firewall-cmd --permanent --zone=trusted --remove-interface={self.bridge_name}"
+                )
             except subprocess.CalledProcessError:
-                print(f"[WARNING] Failed to remove firewalld rule for {self.bridge_name} (may not exist)")
+                print(
+                    f"[WARNING] Failed to remove firewalld rule for {self.bridge_name} (may not exist)"
+                )
 
             # Remove firewalld rule for primary interface
             try:
-                self.run_command(f"sudo firewall-cmd --permanent --zone=trusted --remove-interface={primary_if}")
+                self.run_command(
+                    f"sudo firewall-cmd --permanent --zone=trusted --remove-interface={primary_if}"
+                )
             except subprocess.CalledProcessError:
-                print(f"[WARNING] Failed to remove firewalld rule for {primary_if} (may not exist)")
+                print(
+                    f"[WARNING] Failed to remove firewalld rule for {primary_if} (may not exist)"
+                )
 
             # Reload firewalld
             try:
@@ -131,7 +161,9 @@ class NetworkUninstaller:
                 print("[ERROR] Failed to reload firewalld")
                 sys.exit(1)
         else:
-            print(f"[*] No firewall rules were added during setup (type: {firewall_type})")
+            print(
+                f"[*] No firewall rules were added during setup (type: {firewall_type})"
+            )
 
         # Clean up status file
         try:
@@ -187,13 +219,17 @@ class NetworkUninstaller:
             try:
                 self.run_command(f"sudo nmcli connection delete {primary_if}-slave")
             except subprocess.CalledProcessError:
-                print(f"[WARNING] Failed to delete slave connection '{primary_if}-slave' (may not exist)")
+                print(
+                    f"[WARNING] Failed to delete slave connection '{primary_if}-slave' (may not exist)"
+                )
 
         # Remove firewall rules
         if primary_if:
             self.remove_firewall_rules(primary_if)
         else:
-            print("[WARNING] Skipping firewall rule removal due to unknown primary interface")
+            print(
+                "[WARNING] Skipping firewall rule removal due to unknown primary interface"
+            )
 
         print()
         print("===============================================")
