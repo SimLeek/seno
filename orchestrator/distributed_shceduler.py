@@ -315,16 +315,21 @@ def handle_message(message: Dict[str, Any]):
         if "network" in message_data:
             message_data["network"] = NetworkConfig(**message_data["network"])
         resource_view[message["id"]] = Machine(**message_data)
+        global current_schedule
+        if current_schedule is not None:
+            logger.info(f"Schedule exists despite new machine. Reintegrated machine {message['id']} into resource_view")
+            current_schedule = None
+            schedule_computer()
     elif msg_type == "schedule_hash":
         schedule_hashes[message["sender"]] = message["hash"]
     elif msg_type == "heartbeat":
         heartbeats[message["id"]] = time.time()
         logger.info(f"Received heartbeat from {message['id']}")
         # Reintegrate machine if it was previously removed
-        if message["id"] not in resource_view and message["id"] in MACHINES:
+        global current_schedule
+        if message["id"] not in resource_view and message["id"] in MACHINES and current_schedule is not None:
             resource_view[message["id"]] = MACHINES[message["id"]]
             logger.info(f"Reintegrated machine {message['id']} into resource_view")
-            global current_schedule
             current_schedule = None
             schedule_computer()
     elif msg_type == "startup_ping":
