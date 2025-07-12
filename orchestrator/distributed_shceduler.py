@@ -175,11 +175,9 @@ def compute_schedule(
     # Priority 100 programs must be assigned if compatible machine exists
     for p in programs:
         if p.priority == 100 and not p.run_on_all_machines:
-            compatible_machines = [m for m in machines if can_run(p, m)]
-            if compatible_machines:
-                model.Add(
-                    sum(x[(p.name, m.id)] for m in machines if (p.name, m.id) in x) == 1
-                )
+            model.Add(
+                sum(x[(p.name, m.id)] for m in machines if (p.name, m.id) in x) == 1
+            )
 
     # Resource constraints per machine
     for m in machines:
@@ -532,7 +530,7 @@ def main():
     threading.Thread(target=receive_messages, daemon=True).start()
     wait_for_all_machines()
     resource_view = {m.id: m for m in MACHINES.values()}
-    heartbeats = {m.id: time.time() for m in MACHINES.values()}
+    heartbeats = {m.id: time.time() for m in MACHINES.values() if m.id!=LOCAL_ID}
     threading.Thread(target=resource_monitor, daemon=True).start()
     threading.Thread(target=program_manager, daemon=True).start()
     threading.Thread(target=heartbeat_sender, daemon=True).start()
