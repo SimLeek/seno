@@ -132,6 +132,14 @@ PROGRAMS = [
 ]
 LOCAL_ID = CONFIG["local_id"]
 
+# Global state
+resource_view = {}
+schedule_hashes = {}
+heartbeats = {}
+running_programs = {}
+current_schedule = None
+startup_responses = {}
+orchestration_started = False
 
 def get_local_resources() -> Machine:
     """Gather local resource information."""
@@ -312,6 +320,13 @@ def handle_message(message: Dict[str, Any]):
     elif msg_type == "heartbeat":
         heartbeats[message["id"]] = time.time()
         logger.info(f"Received heartbeat from {message['id']}")
+        # Reintegrate machine if it was previously removed
+        if message["id"] not in resource_view and message["id"] in MACHINES:
+            resource_view[message["id"]] = MACHINES[message["id"]]
+            logger.info(f"Reintegrated machine {message['id']} into resource_view")
+            global current_schedule
+            current_schedule = None
+            schedule_computer()
     elif msg_type == "startup_ping":
         pong_msg = StartupPongMessage(type="startup_pong", id=LOCAL_ID)
         try:
@@ -376,16 +391,6 @@ def wait_for_all_machines():
         MACHINES = {k: v for k, v in MACHINES.items() if k in available_machine_ids}
         logger.info(f"Updated machine list: {list(MACHINES.keys())}")
     return True
-
-
-# Global state
-resource_view = {}
-schedule_hashes = {}
-heartbeats = {}
-running_programs = {}
-current_schedule = None
-startup_responses = {}
-orchestration_started = False
 
 
 def resource_monitor():
