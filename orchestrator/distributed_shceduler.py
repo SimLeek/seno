@@ -65,18 +65,18 @@ class Program:
     run_on_all_machines: bool = False
 
 
-@dataclass
-class ResourceMessage:
-    type: str
-    id: str
-    ip: str
-    cpu_cores: int
-    cpu_ghz: float
-    ram_gb: int
-    vram_gb: int
-    gpus: List[Dict[str, Any]]
-    devices: List[str]
-    network: Dict[str, Any]
+#@dataclass
+#class ResourceMessage:
+#    type: str
+#    id: str
+#    ip: str
+#    cpu_cores: int
+#    cpu_ghz: float
+#    ram_gb: int
+#    vram_gb: int
+#    gpus: List[Dict[str, Any]]
+#    devices: List[str]
+#    network: Dict[str, Any]
 
 
 @dataclass
@@ -303,24 +303,25 @@ def receive_messages():
             handle_message(message_dict)
         except Exception as e:
             logger.error(f"Error processing message: {e}")
+        time.sleep(0)  # thread switch
 
 
 def handle_message(message: Dict[str, Any]):
     """Handle incoming messages."""
     global current_schedule
     msg_type = message.get("type")
-    if msg_type == "resource":
-        message_data = {k: v for k, v in message.items() if k != "type"}
-        if "gpus" in message_data:
-            message_data["gpus"] = [GPU(**gpu) for gpu in message_data["gpus"]]
-        if "network" in message_data:
-            message_data["network"] = NetworkConfig(**message_data["network"])
-        resource_view[message["id"]] = Machine(**message_data)
-        if current_schedule is not None:
-            logger.info(f"Schedule exists despite new machine. Reintegrated machine {message['id']} into resource_view")
-            current_schedule = None
-            schedule_computer()
-    elif msg_type == "schedule_hash":
+    #if msg_type == "resource":
+    #    message_data = {k: v for k, v in message.items() if k != "type"}
+    #    if "gpus" in message_data:
+    #        message_data["gpus"] = [GPU(**gpu) for gpu in message_data["gpus"]]
+    #    if "network" in message_data:
+    #        message_data["network"] = NetworkConfig(**message_data["network"])
+    #    resource_view[message["id"]] = Machine(**message_data)
+    #    if current_schedule is not None:
+    #        logger.info(f"Schedule exists despite new machine. Reintegrated machine {message['id']} into resource_view")
+    #        current_schedule = None
+    #        schedule_computer()
+    if msg_type == "schedule_hash":
         schedule_hashes[message["sender"]] = message["hash"]
     elif msg_type == "heartbeat":
         heartbeats[message["id"]] = time.time()
@@ -397,26 +398,26 @@ def wait_for_all_machines():
     return True
 
 
-def resource_monitor():
-    """Periodically share local resources."""
-    while True:
-        if orchestration_started:
-            resources = get_local_resources()
-            broadcast(
-                ResourceMessage(
-                    type="resource",
-                    id=resources.id,
-                    ip=resources.ip,
-                    cpu_cores=resources.cpu_cores,
-                    cpu_ghz=resources.cpu_ghz,
-                    ram_gb=resources.ram_gb,
-                    vram_gb=resources.vram_gb,
-                    gpus=[asdict(gpu) for gpu in resources.gpus],
-                    devices=resources.devices,
-                    network=asdict(resources.network),
-                )
-            )
-        time.sleep(0.2)
+#def resource_monitor():
+#    """Periodically share local resources."""
+#    while True:
+#        if orchestration_started:
+#            resources = get_local_resources()
+#            broadcast(
+#                ResourceMessage(
+#                    type="resource",
+#                    id=resources.id,
+#                    ip=resources.ip,
+#                    cpu_cores=resources.cpu_cores,
+#                    cpu_ghz=resources.cpu_ghz,
+#                    ram_gb=resources.ram_gb,
+#                    vram_gb=resources.vram_gb,
+#                    gpus=[asdict(gpu) for gpu in resources.gpus],
+#                    devices=resources.devices,
+#                    network=asdict(resources.network),
+#                )
+#            )
+#        time.sleep(0.2)
 
 
 def schedule_computer():
@@ -540,7 +541,7 @@ def main():
     wait_for_all_machines()
     resource_view = {m.id: m for m in MACHINES.values()}
     heartbeats = {m.id: time.time() for m in MACHINES.values() if m.id!=LOCAL_ID}
-    threading.Thread(target=resource_monitor, daemon=True).start()
+    #threading.Thread(target=resource_monitor, daemon=True).start()
     threading.Thread(target=program_manager, daemon=True).start()
     threading.Thread(target=heartbeat_sender, daemon=True).start()
     threading.Thread(target=heartbeat_monitor, daemon=True).start()
