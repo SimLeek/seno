@@ -581,6 +581,10 @@ def program_manager():
                 if proc and proc.poll() is not None:
                     return_code = proc.returncode
                     logger.info(f"Program {prog_name} exited with code {return_code}")
+
+                    # Remove the process immediately to prevent repeated detection
+                    del running_programs[prog_name]
+
                     if (
                         prog_name in current_schedule
                         and current_schedule[prog_name] == LOCAL_ID
@@ -600,12 +604,11 @@ def program_manager():
                                 None,
                             )
                             if prog:
-                                proc = run_program(prog.path)
-                                if proc:
-                                    running_programs[prog_name] = proc
+                                new_proc = run_program(prog.path)
+                                if new_proc:
+                                    running_programs[prog_name] = new_proc
                     else:
                         stop_program(proc)
-                        del running_programs[prog_name]
             for prog in PROGRAMS:
                 if prog.run_on_all_machines:
                     prog_key = f"{prog.name}_{LOCAL_ID}"
