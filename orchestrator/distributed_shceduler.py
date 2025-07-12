@@ -59,6 +59,7 @@ class Program:
     network_bandwidth_bps: int
     priority: int
     path: str
+    vram_gb: int = 0
     run_on_all_machines: bool = False
 
 
@@ -165,23 +166,22 @@ def compute_schedule(machines: List[Machine], programs: List[Program]) -> Dict[s
     for m in machines:
         # CPU cores
         model.Add(
-            sum(x[(p.name, m.id)] * p.cpu_cores for p in programs if (p.name, m.id) in x)
+            sum(x[(p.name, m.id)] * int(p.cpu_cores) for p in programs if (p.name, m.id) in x)
             <= m.cpu_cores
         )
         # RAM
         model.Add(
-            sum(x[(p.name, m.id)] * p.ram_gb for p in programs if (p.name, m.id) in x)
+            sum(x[(p.name, m.id)] * int(p.ram_gb) for p in programs if (p.name, m.id) in x)
             <= m.ram_gb
         )
-        # VRAM (if applicable)
-        if m.vram_gb > 0:
-            model.Add(
-                sum(x[(p.name, m.id)] * p.ram_gb for p in programs if (p.name, m.id) in x)
-                <= m.vram_gb
-            )
+        # VRAM
+        model.Add(
+            sum(x[(p.name, m.id)] * int(p.vram_gb) for p in programs if (p.name, m.id) in x)
+            <= m.vram_gb
+        )
         # Network bandwidth
         model.Add(
-            sum(x[(p.name, m.id)] * p.network_bandwidth_bps for p in programs if (p.name, m.id) in x)
+            sum(x[(p.name, m.id)] * int(p.network_bandwidth_bps) for p in programs if (p.name, m.id) in x)
             <= m.network.max_input_bandwidth_bps
         )
         # GPUs (simplified: count programs requiring GPU)
@@ -193,7 +193,7 @@ def compute_schedule(machines: List[Machine], programs: List[Program]) -> Dict[s
 
     # Objective: Maximize sum of priorities
     objective = sum(
-        x[(p.name, m.id)] * p.priority
+        x[(p.name, m.id)] * int(p.priority)
         for p in programs
         for m in machines
         if (p.name, m.id) in x
@@ -216,8 +216,15 @@ def compute_schedule(machines: List[Machine], programs: List[Program]) -> Dict[s
         if unassigned:
             logger.warning(f"Unassigned programs due to resource/device constraints: {', '.join(unassigned)}")
         return assignment
-    logger.error("No feasible schedule found")
-    return {}
+    else:
+        logger.error(f"Scheduling failed. Status: {solver.StatusName(status)}")
+        # Log resource usage
+        for m in machines:
+            logger.info(f"Machine {m.id}: CPU={m.cpu_cores}, RAM={m.ram_gb}, VRAM={m.vram_gb}, Devices={m.devices}")
+        for p in programs:
+            logger.info(
+                f"Program {p.name}: CPU={p.cpu_cores}, RAM={p.ram_gb}, Devices={p.required_devices}, RunOnAll={p.run_on_all_machines}")
+        return {}
 
 
 def broadcast(message: Any):
@@ -250,7 +257,14 @@ def handle_message(message: Dict[str, Any]):
     """Handle incoming messages."""
     msg_type = message.get("type")
     if msg_type == "resource":
-        resource_view[message["id"]] = Machine(**message)
+        # Filter out the 'type' field before creating Machine object
+        machine_data = {k: v for k, v in message.items() if k != "type"}
+        # Convert nested dictionaries back to dataclass objects
+        if "gpus" in machine_data:
+            machine_data["gpus"] = [GPU(**gpu) for gpu in machine_data["gpus"]]
+        if "network" in machine_data:
+            machine_data["network"] = NetworkConfig(**machine_data["network"])
+        resource_view[message["id"]] = Machine(**machine_data)
     elif msg_type == "schedule_hash":
         schedule_hashes[message["sender"]] = message["hash"]
     elif msg_type == "heartbeat":
@@ -328,7 +342,6 @@ def wait_for_all_machines():
         logger.warning("Proceeding with available machines only.")
 
         # Update MACHINES to only include responding machines + local machine
-        global MACHINES
         available_machine_ids = responding_machines | {LOCAL_ID}
         MACHINES = {k: v for k, v in MACHINES.items() if k in available_machine_ids}
         logger.info(f"Updated machine list: {list(MACHINES.keys())}")
@@ -399,6 +412,7 @@ def program_manager():
             for prog_name, proc in list(running_programs.items()):
                 if proc and proc.poll() is not None:
                     return_code = proc.return_code
+                    logger.info(f"Program {prog_name} exited with code {return_code}")
                     if prog_name in current_schedule and current_schedule[prog_name] == LOCAL_ID:
                         if return_code == 0:
                             logger.info(f"Program {prog_name} ended naturally")
