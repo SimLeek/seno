@@ -307,6 +307,7 @@ def receive_messages():
 
 def handle_message(message: Dict[str, Any]):
     """Handle incoming messages."""
+    global current_schedule
     msg_type = message.get("type")
     if msg_type == "resource":
         message_data = {k: v for k, v in message.items() if k != "type"}
@@ -315,7 +316,6 @@ def handle_message(message: Dict[str, Any]):
         if "network" in message_data:
             message_data["network"] = NetworkConfig(**message_data["network"])
         resource_view[message["id"]] = Machine(**message_data)
-        global current_schedule
         if current_schedule is not None:
             logger.info(f"Schedule exists despite new machine. Reintegrated machine {message['id']} into resource_view")
             current_schedule = None
@@ -326,7 +326,6 @@ def handle_message(message: Dict[str, Any]):
         heartbeats[message["id"]] = time.time()
         logger.info(f"Received heartbeat from {message['id']}")
         # Reintegrate machine if it was previously removed
-        global current_schedule
         if message["id"] not in resource_view and message["id"] in MACHINES and current_schedule is not None:
             resource_view[message["id"]] = MACHINES[message["id"]]
             logger.info(f"Reintegrated machine {message['id']} into resource_view")
