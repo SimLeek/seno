@@ -66,25 +66,20 @@ class Program:
     run_on_all_machines: bool = False
 
 
-#@dataclass
-#class ResourceMessage:
-#    type: str
-#    id: str
-#    ip: str
-#    cpu_cores: int
-#    cpu_ghz: float
-#    ram_gb: int
-#    vram_gb: int
-#    gpus: List[Dict[str, Any]]
-#    devices: List[str]
-#    network: Dict[str, Any]
-
-
 @dataclass
 class ScheduleHashMessage:
     type: str
     sender: str
-    hash: str
+    fingerprint: str
+    assignment: Dict[str, str]
+
+
+@dataclass
+class ScheduleAckMessage:
+    type: str
+    sender: str
+    fingerprint: str
+    received_from: List[str]  # List of machines this sender has received schedules from
 
 
 @dataclass
@@ -104,12 +99,6 @@ class StartupPongMessage:
     type: str
     id: str
 
-@dataclass
-class ScheduleHashMessage:
-    type: str
-    sender: str
-    fingerprint: str  # Changed from hash to fingerprint
-    assignment: Dict[str, str]  # Add the actual assignment for verification
 
 # Load configuration
 with open("config.json", "r") as f:
@@ -141,16 +130,18 @@ LOCAL_ID = CONFIG["local_id"]
 
 # Global state
 resource_view = {}
-schedule_hashes = {}
 heartbeats = {}
 running_programs = {}
 current_schedule = None
 startup_responses = {}
 orchestration_started = False
 
+# Enhanced schedule agreement state
 schedule_agreement_lock = threading.Lock()
-schedule_fingerprints = {}
+schedule_fingerprints = {}  # {sender: {fingerprint, assignment, timestamp}}
+schedule_acks = {}  # {sender: {fingerprint, received_from, timestamp}}
 schedule_agreement_event = threading.Event()
+
 
 def get_local_resources() -> Machine:
     """Gather local resource information."""
@@ -163,12 +154,14 @@ def can_run(program: Program, machine: Machine) -> bool:
     available_devices = set(machine.devices)
     yes_can_run = required_devices.issubset(available_devices)
     if not yes_can_run:
-        print(f"p{program.name},m{machine.id} cannot run. missing requirements: {required_devices.difference(available_devices)}")
+        print(
+            f"p{program.name},m{machine.id} cannot run. missing requirements: {required_devices.difference(available_devices)}"
+        )
     return yes_can_run
 
 
 def compute_schedule(
-        machines: List[Machine], programs: List[Program]
+    machines: List[Machine], programs: List[Program]
 ) -> tuple[Dict[str, str], str]:
     """Compute optimal program assignment using OR-Tools."""
     model = cp_model.CpModel()
@@ -280,21 +273,15 @@ def compute_schedule(
             )
 
         # Get the solution fingerprint
-        fingerprint = str(hash(json.dumps(assignment)))
+        hashy = hashlib.sha256()
+        hashy.update(json.dumps(assignment, sort_keys=True).encode("utf-8"))
+        fingerprint = hashy.hexdigest()
         logger.info(f"Solution fingerprint: {fingerprint}")
         logger.info(f"Computed assignment: {assignment}")
 
         return assignment, fingerprint
     else:
         logger.error(f"Scheduling failed. Status: {solver.StatusName(status)}")
-        for m in machines:
-            logger.info(
-                f"Machine {m.id}: CPU={m.cpu_cores}, RAM={m.ram_gb}, VRAM={m.vram_gb}, Devices={m.devices}"
-            )
-        for p in programs:
-            logger.info(
-                f"Program {p.name}: CPU={p.cpu_cores}, RAM={p.ram_gb}, VRAM={p.vram_gb}, Devices={p.required_devices}, RunOnAll={p.run_on_all_machines}"
-            )
         return {}, ""
 
 
@@ -327,7 +314,7 @@ def receive_messages():
 
 def handle_message(message: Dict[str, Any]):
     """Handle incoming messages."""
-    global current_schedule, schedule_fingerprints
+    global current_schedule
     msg_type = message.get("type")
 
     if msg_type == "schedule_hash":
@@ -337,26 +324,59 @@ def handle_message(message: Dict[str, Any]):
             assignment = message["assignment"]
 
             logger.info(f"Received schedule from {sender}: fingerprint={fingerprint}")
-            logger.debug(f"Received assignment from {sender}: {assignment}")
 
             schedule_fingerprints[sender] = {
                 "fingerprint": fingerprint,
                 "assignment": assignment,
-                "timestamp": time.time()
+                "timestamp": time.time(),
             }
 
-            # Check if we have responses from all expected machines
-            expected_machines = set(m.id for m in MACHINES.values() if m.id != LOCAL_ID)
-            received_machines = set(schedule_fingerprints.keys())
+            # Send acknowledgment with list of machines we've received schedules from
+            received_from = list(schedule_fingerprints.keys())
+            ack_msg = ScheduleAckMessage(
+                type="schedule_ack",
+                sender=LOCAL_ID,
+                fingerprint=fingerprint,
+                received_from=received_from,
+            )
 
-            if expected_machines.issubset(received_machines):
-                logger.info("Received schedule responses from all machines")
-                schedule_agreement_event.set()
+            # Send ACK back to the sender
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sender_ip = next(m.ip for m in MACHINES.values() if m.id == sender)
+                sock.sendto(json.dumps(asdict(ack_msg)).encode(), (sender_ip, 5000))
+                sock.close()
+                logger.debug(f"Sent ACK to {sender}")
+            except Exception as e:
+                logger.error(f"Failed to send ACK to {sender}: {e}")
+
+    elif msg_type == "schedule_ack":
+        with schedule_agreement_lock:
+            sender = message["sender"]
+            fingerprint = message["fingerprint"]
+            received_from = message["received_from"]
+
+            logger.info(
+                f"Received ACK from {sender}: fingerprint={fingerprint}, received_from={received_from}"
+            )
+
+            schedule_acks[sender] = {
+                "fingerprint": fingerprint,
+                "received_from": received_from,
+                "timestamp": time.time(),
+            }
+
+            # Check if we can proceed with agreement
+            check_schedule_agreement()
 
     elif msg_type == "heartbeat":
         heartbeats[message["id"]] = time.time()
         # Reintegrate machine if it was previously removed
-        if message["id"] not in resource_view and message["id"] in MACHINES and current_schedule is not None:
+        if (
+            message["id"] not in resource_view
+            and message["id"] in MACHINES
+            and current_schedule is not None
+        ):
             resource_view[message["id"]] = MACHINES[message["id"]]
             logger.info(f"Reintegrated machine {message['id']} into resource_view")
             current_schedule = None
@@ -374,6 +394,37 @@ def handle_message(message: Dict[str, Any]):
 
     elif msg_type == "startup_pong":
         startup_responses[message["id"]] = time.time()
+
+
+def check_schedule_agreement():
+    """Check if we have enough information to proceed with schedule agreement."""
+    expected_machines = set(m.id for m in MACHINES.values() if m.id != LOCAL_ID)
+
+    # Check if we have ACKs from all machines
+    received_acks = set(schedule_acks.keys())
+
+    if not expected_machines.issubset(received_acks):
+        logger.debug(
+            f"Still waiting for ACKs from: {expected_machines - received_acks}"
+        )
+        return
+
+    # Check if all machines have received schedules from all other machines
+    all_machines = set(m.id for m in MACHINES.values())
+
+    for sender, ack_data in schedule_acks.items():
+        received_from_set = set(ack_data["received_from"])
+        # Each machine should have received from all others (excluding itself)
+        expected_from = all_machines - {sender}
+
+        if not expected_from.issubset(received_from_set):
+            missing = expected_from - received_from_set
+            logger.debug(f"Machine {sender} hasn't received from: {missing}")
+            return
+
+    # If we get here, all machines have received schedules from all other machines
+    logger.info("All machines have received all schedules. Proceeding with agreement.")
+    schedule_agreement_event.set()
 
 
 def run_program(program_path: str) -> subprocess.Popen:
@@ -417,6 +468,7 @@ def wait_for_all_machines():
         missing_machines = expected_machines - responding_machines
         logger.info(f"Still waiting for machines: {list(missing_machines)}")
         time.sleep(1)
+
     responding_machines = set(startup_responses.keys())
     expected_machines = set(m.id for m in MACHINES.values() if m.id != LOCAL_ID)
     missing_machines = expected_machines - responding_machines
@@ -429,31 +481,9 @@ def wait_for_all_machines():
     return True
 
 
-#def resource_monitor():
-#    """Periodically share local resources."""
-#    while True:
-#        if orchestration_started:
-#            resources = get_local_resources()
-#            broadcast(
-#                ResourceMessage(
-#                    type="resource",
-#                    id=resources.id,
-#                    ip=resources.ip,
-#                    cpu_cores=resources.cpu_cores,
-#                    cpu_ghz=resources.cpu_ghz,
-#                    ram_gb=resources.ram_gb,
-#                    vram_gb=resources.vram_gb,
-#                    gpus=[asdict(gpu) for gpu in resources.gpus],
-#                    devices=resources.devices,
-#                    network=asdict(resources.network),
-#                )
-#            )
-#        time.sleep(0.2)
-
-
 def schedule_computer():
-    """Compute and agree on schedule once at startup."""
-    global current_schedule, schedule_fingerprints
+    """Compute and agree on schedule using two-phase protocol."""
+    global current_schedule
 
     if not resource_view:
         logger.error("No machines available for scheduling")
@@ -472,6 +502,7 @@ def schedule_computer():
     # Reset agreement tracking
     with schedule_agreement_lock:
         schedule_fingerprints.clear()
+        schedule_acks.clear()
         schedule_agreement_event.clear()
 
     # Broadcast our schedule
@@ -481,37 +512,40 @@ def schedule_computer():
             type="schedule_hash",
             sender=LOCAL_ID,
             fingerprint=fingerprint,
-            assignment=assignment
+            assignment=assignment,
         )
     )
 
-    # Wait for responses from all machines (with timeout)
-    logger.info("Waiting for schedule responses from other machines...")
-    agreement_reached = schedule_agreement_event.wait(timeout=10.0)
+    # Wait for full agreement (with timeout)
+    logger.info("Waiting for schedule agreement from all machines...")
+    agreement_reached = schedule_agreement_event.wait(timeout=15.0)
 
     if not agreement_reached:
-        logger.error("Timeout waiting for schedule responses")
+        logger.error("Timeout waiting for schedule agreement")
+        with schedule_agreement_lock:
+            logger.error(f"Received ACKs from: {list(schedule_acks.keys())}")
+            logger.error(
+                f"Expected ACKs from: {[m.id for m in MACHINES.values() if m.id != LOCAL_ID]}"
+            )
         return
 
-    # Analyze responses
+    # Analyze final agreement
     with schedule_agreement_lock:
-        logger.info("Analyzing schedule agreement...")
+        logger.info("Analyzing final schedule agreement...")
 
         # Count fingerprints (including our own)
         fingerprint_counts = defaultdict(int)
         fingerprint_counts[fingerprint] += 1  # Count our own
 
-        assignments_by_fingerprint = defaultdict(list)
-        assignments_by_fingerprint[fingerprint].append(f"{LOCAL_ID}(local)")
+        for sender, ack_data in schedule_acks.items():
+            fp = ack_data["fingerprint"]
+            # ack_data doesn't contain assignment, but if it fails again we'll make it contain it
+            #if ack_data["assignment"] == assignment:
+            #    logger.warning(f"Bad fingerprinting from {sender}. Data matches. Overriding.")
+            #    fp = fingerprint
+            #    ack_data["fingerprint"] = fingerprint
 
-        for sender, data in schedule_fingerprints.items():
-            fp = data["fingerprint"]
-            if data["assignment"] == assignment:
-                logger.warning(f"Bad fingerprinting from {sender}. Data matches. Overriding.")
-                fp = fingerprint
-                data["fingerprint"] = fingerprint
             fingerprint_counts[fp] += 1
-            assignments_by_fingerprint[fp].append(sender)
 
         logger.info(f"Fingerprint counts: {dict(fingerprint_counts)}")
 
@@ -527,27 +561,15 @@ def schedule_computer():
                 break
 
         if majority_fingerprint == fingerprint:
-            logger.info(f"✓ Schedule agreement reached! Fingerprint: {majority_fingerprint}")
-            logger.info(f"  Agreeing machines: {assignments_by_fingerprint[majority_fingerprint]}")
+            logger.info(
+                f"✓ Schedule agreement reached! Fingerprint: {majority_fingerprint}"
+            )
             current_schedule = assignment
             logger.info(f"  Final schedule: {assignment}")
         else:
             logger.error("✗ No majority agreement on schedule")
-            if majority_fingerprint:
-                logger.error(f"  Majority fingerprint: {majority_fingerprint}")
-                logger.error(f"  Our fingerprint: {fingerprint}")
-                logger.error(f"  Majority machines: {assignments_by_fingerprint[majority_fingerprint]}")
-            else:
-                logger.error("  No fingerprint achieved majority")
-
-            # Debug: Show all assignments
-            logger.error("  All received assignments:")
-            logger.error(f"    {LOCAL_ID}(local): {assignment}")
-            for sender, data in schedule_fingerprints.items():
-                logger.error(f"    {sender}: {data['assignment']}")
-
-        # Clear fingerprints for next round
-        schedule_fingerprints.clear()
+            logger.error(f"  Our fingerprint: {fingerprint}")
+            logger.error(f"  Majority fingerprint: {majority_fingerprint}")
 
 
 def program_manager():
@@ -557,7 +579,7 @@ def program_manager():
         if orchestration_started and current_schedule:
             for prog_name, proc in list(running_programs.items()):
                 if proc and proc.poll() is not None:
-                    return_code = proc.return_code
+                    return_code = proc.returncode
                     logger.info(f"Program {prog_name} exited with code {return_code}")
                     if (
                         prog_name in current_schedule
@@ -637,8 +659,7 @@ def main():
     threading.Thread(target=receive_messages, daemon=True).start()
     wait_for_all_machines()
     resource_view = {m.id: m for m in MACHINES.values()}
-    heartbeats = {m.id: time.time() for m in MACHINES.values() if m.id!=LOCAL_ID}
-    #threading.Thread(target=resource_monitor, daemon=True).start()
+    heartbeats = {m.id: time.time() for m in MACHINES.values() if m.id != LOCAL_ID}
     threading.Thread(target=program_manager, daemon=True).start()
     threading.Thread(target=heartbeat_sender, daemon=True).start()
     threading.Thread(target=heartbeat_monitor, daemon=True).start()
