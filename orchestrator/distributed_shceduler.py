@@ -280,7 +280,7 @@ def compute_schedule(
             )
 
         # Get the solution fingerprint
-        fingerprint = hashlib.md5((solver.solution_info()).encode()).hexdigest()
+        fingerprint = str(hash(json.dumps(assignment)))
         logger.info(f"Solution fingerprint: {fingerprint}")
         logger.info(f"Computed assignment: {assignment}")
 
