@@ -325,7 +325,7 @@ def handle_message(message: Dict[str, Any]):
         schedule_hashes[message["sender"]] = message["hash"]
     elif msg_type == "heartbeat":
         heartbeats[message["id"]] = time.time()
-        logger.info(f"Received heartbeat from {message['id']}")
+        #logger.info(f"Received heartbeat from {message['id']}")
         # Reintegrate machine if it was previously removed
         if message["id"] not in resource_view and message["id"] in MACHINES and current_schedule is not None:
             resource_view[message["id"]] = MACHINES[message["id"]]
@@ -524,7 +524,7 @@ def heartbeat_monitor():
         if orchestration_started:
             current_time = time.time()
             for machine_id, last_beat in list(heartbeats.items()):
-                if current_time - last_beat > 0.6:  # 3 missed heartbeats (600ms)
+                if current_time - last_beat > 2.0:  # 10 missed heartbeats
                     logger.warning(f"Machine {machine_id} failed")
                     resource_view.pop(machine_id, None)
                     heartbeats.pop(machine_id, None)
