@@ -475,7 +475,7 @@ def schedule_computer():
         schedule_agreement_event.clear()
 
     # Broadcast our schedule
-    logger.info(f"Broadcasting schedule: fingerprint={fingerprint}")
+    logger.info(f"Broadcasting schedule: assignment={assignment}")
     broadcast(
         ScheduleHashMessage(
             type="schedule_hash",
@@ -506,6 +506,10 @@ def schedule_computer():
 
         for sender, data in schedule_fingerprints.items():
             fp = data["fingerprint"]
+            if data["assignment"] == assignment:
+                logger.warning(f"Bad fingerprinting from {sender}. Data matches. Overriding.")
+                fp = fingerprint
+                data["fingerprint"] = fingerprint
             fingerprint_counts[fp] += 1
             assignments_by_fingerprint[fp].append(sender)
 
